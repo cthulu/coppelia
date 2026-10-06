@@ -1,11 +1,15 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:file/local.dart';
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:mime/mime.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/album.dart';
+import '../models/download_task.dart';
 import '../models/artist.dart';
 import '../models/cached_audio_entry.dart';
 import '../models/genre.dart';
@@ -14,15 +18,35 @@ import '../models/media_item.dart';
 import '../models/playback_resume_state.dart';
 import '../models/playlist.dart';
 import 'log_service.dart';
+import 'background_audio_downloads.dart';
+
+/// A cache clear or eviction invalidated an in-flight download.
+class CacheDownloadCancelled implements Exception {
+  const CacheDownloadCancelled();
+}
+
+class CachedAudioFile extends FileInfo {
+  CachedAudioFile(FileInfo source, this.bytes)
+      : super(source.file, source.source, source.validTill, source.originalUrl);
+
+  final int bytes;
+}
 
 /// Manages cached metadata and audio assets.
 class CacheStore {
   /// Creates a cache manager instance.
-  CacheStore();
+  CacheStore({CacheManager? audioCache, this.backgroundDownloads})
+      : _audioCache = audioCache ??
+            CacheManager(
+              Config(_audioCacheKey,
+                  stalePeriod: const Duration(days: 3650),
+                  maxNrOfCacheObjects: 20000),
+            );
 
   /// Default cache size limit (500 MB).
   static const int defaultCacheMaxBytes = 500 * 1024 * 1024;
 
+  static const _downloadQueueKey = 'audio_download_queue';
   static const _audioCacheKey = 'coppelia_audio_cache';
   static const _playlistsKey = 'cached_playlists';
   static const _tracksKey = 'cached_playlist_tracks';
@@ -73,6 +97,7 @@ class CacheStore {
 
   static const _profileKeys = <String>[
     ..._metadataKeys,
+    _downloadQueueKey,
     _cachedAudioKey,
     _pinnedAudioKey,
     _pinnedAudioItemsKey,
@@ -81,118 +106,164 @@ class CacheStore {
 
   String? _scope;
 
-  final CacheManager _audioCache = CacheManager(
-    Config(
-      _audioCacheKey,
-      stalePeriod: const Duration(days: 3650),
-      maxNrOfCacheObjects: 20000,
-    ),
-  );
+  final CacheManager _audioCache;
+  final BackgroundAudioDownloads? backgroundDownloads;
+  bool localPlaybackOnly = false;
+
+  Future<void> cancelDownloads({String? streamUrl}) async {
+    final scope = _scope;
+    final key =
+        streamUrl == null ? null : _audioKeyForStreamUrl(streamUrl, scope);
+    _invalidateDownloads(scope, cacheKey: key);
+    final pending = _audioDownloads
+        .where((download) =>
+            download.scope == scope &&
+            (key == null || download.cacheKey == key))
+        .map((download) => download.finished.future)
+        .toList();
+    await backgroundDownloads?.cancel(scope: scope, key: key);
+    if (backgroundDownloads != null) {
+      await Future.wait(pending);
+    }
+  }
+
+  Future<void> _pendingOperation = Future<void>.value();
+  final Set<_AudioDownload> _audioDownloads = {};
+  int _downloadOrder = 0;
+
+  // Only storage work belongs here; network transfers run outside this queue.
+  Future<T> _serialized<T>(Future<T> Function() operation) {
+    final result = _pendingOperation.then((_) => operation());
+    _pendingOperation =
+        result.then<void>((_) {}, onError: (Object _, StackTrace __) {});
+    return result;
+  }
+
+  void _invalidateDownloads(String? scope, {String? cacheKey}) {
+    for (final download in _audioDownloads) {
+      if (download.scope == scope &&
+          (cacheKey == null || download.cacheKey == cacheKey)) {
+        download.invalidated = true;
+      }
+    }
+  }
 
   /// Activates the profile scope used for library and offline data.
   void activateScope(String? serverId) {
+    if (_scope != serverId) {
+      _invalidateDownloads(_scope);
+    }
     _scope = serverId;
   }
 
   /// Moves legacy single-session cache data into a server-specific scope.
-  Future<void> migrateLegacyData(String serverId) async {
-    final preferences = await SharedPreferences.getInstance();
-    final legacyAudioEntries = _readJsonMap(
-      preferences.getString(_cachedAudioKey),
-    );
-    final migratedAudioEntries = <String, dynamic>{};
-    for (final entry in legacyAudioEntries.entries) {
-      final payload = entry.value;
-      if (payload is! Map) {
-        continue;
-      }
-      final payloadMap = Map<String, dynamic>.from(payload);
-      final mediaItem = payloadMap['mediaItem'];
-      final itemId = mediaItem is Map<String, dynamic>
-          ? mediaItem['id']?.toString()
-          : _streamItemId(entry.key);
-      if (itemId == null || itemId.isEmpty) {
-        continue;
-      }
-      migratedAudioEntries['$serverId:audio:$itemId'] = {
-        ...payloadMap,
-        _legacyCacheKeyField: entry.key,
-      };
-    }
-
-    for (final key in _profileKeys) {
-      if (key == _cachedAudioKey) {
-        continue;
-      }
-      final value = preferences.get(key);
-      if (value != null) {
-        await _copyPreferenceValue(
-            preferences, _scopedKey(key, serverId), value);
-      }
-    }
-    if (migratedAudioEntries.isNotEmpty) {
-      await preferences.setString(
-        _scopedKey(_cachedAudioKey, serverId),
-        jsonEncode(migratedAudioEntries),
+  Future<void> migrateLegacyData(String serverId) {
+    return _serialized(() async {
+      final preferences = await SharedPreferences.getInstance();
+      final legacyAudioEntries = _readJsonMap(
+        preferences.getString(_cachedAudioKey),
       );
-    }
-    final legacyPinned = _readJsonList(preferences.getString(_pinnedAudioKey));
-    if (legacyPinned.isNotEmpty) {
-      await preferences.setString(
-        _scopedKey(_pinnedAudioKey, serverId),
-        jsonEncode(
-          legacyPinned
-              .map((entry) => _audioKeyForStreamUrl(entry.toString(), serverId))
-              .toSet()
-              .toList(),
-        ),
-      );
-    }
-    final legacyPinnedItems = _readJsonMap(
-      preferences.getString(_pinnedAudioItemsKey),
-    );
-    if (legacyPinnedItems.isNotEmpty) {
-      final migratedPinnedItems = <String, dynamic>{};
-      for (final entry in legacyPinnedItems.entries) {
-        final item = entry.value;
-        final itemId = item is Map<String, dynamic>
-            ? item['id']?.toString()
+      final migratedAudioEntries = <String, dynamic>{};
+      for (final entry in legacyAudioEntries.entries) {
+        final payload = entry.value;
+        if (payload is! Map) {
+          continue;
+        }
+        final payloadMap = Map<String, dynamic>.from(payload);
+        final mediaItem = payloadMap['mediaItem'];
+        final itemId = mediaItem is Map<String, dynamic>
+            ? mediaItem['id']?.toString()
             : _streamItemId(entry.key);
-        if (itemId != null && itemId.isNotEmpty) {
-          migratedPinnedItems['$serverId:audio:$itemId'] = item;
+        if (itemId == null || itemId.isEmpty) {
+          continue;
+        }
+        migratedAudioEntries['$serverId:audio:$itemId'] = {
+          ...payloadMap,
+          _legacyCacheKeyField: entry.key,
+        };
+      }
+
+      for (final key in _profileKeys) {
+        if (key == _cachedAudioKey) {
+          continue;
+        }
+        final value = preferences.get(key);
+        if (value != null) {
+          await _copyPreferenceValue(
+              preferences, _scopedKey(key, serverId), value);
         }
       }
-      await preferences.setString(
-        _scopedKey(_pinnedAudioItemsKey, serverId),
-        jsonEncode(migratedPinnedItems),
+      if (migratedAudioEntries.isNotEmpty) {
+        await preferences.setString(
+          _scopedKey(_cachedAudioKey, serverId),
+          jsonEncode(migratedAudioEntries),
+        );
+      }
+      final legacyPinned =
+          _readJsonList(preferences.getString(_pinnedAudioKey));
+      if (legacyPinned.isNotEmpty) {
+        await preferences.setString(
+          _scopedKey(_pinnedAudioKey, serverId),
+          jsonEncode(
+            legacyPinned
+                .map((entry) =>
+                    _audioKeyForStreamUrl(entry.toString(), serverId))
+                .toSet()
+                .toList(),
+          ),
+        );
+      }
+      final legacyPinnedItems = _readJsonMap(
+        preferences.getString(_pinnedAudioItemsKey),
       );
-    }
-    final legacyWholeLibraryPins = _readJsonList(
-      preferences.getString(_wholeLibraryPinnedAudioKey),
-    );
-    if (legacyWholeLibraryPins.isNotEmpty) {
-      await preferences.setString(
-        _scopedKey(_wholeLibraryPinnedAudioKey, serverId),
-        jsonEncode(
-          legacyWholeLibraryPins
-              .map((entry) => _audioKeyForStreamUrl(entry.toString(), serverId))
-              .toSet()
-              .toList(),
-        ),
+      if (legacyPinnedItems.isNotEmpty) {
+        final migratedPinnedItems = <String, dynamic>{};
+        for (final entry in legacyPinnedItems.entries) {
+          final item = entry.value;
+          final itemId = item is Map<String, dynamic>
+              ? item['id']?.toString()
+              : _streamItemId(entry.key);
+          if (itemId != null && itemId.isNotEmpty) {
+            migratedPinnedItems['$serverId:audio:$itemId'] = item;
+          }
+        }
+        await preferences.setString(
+          _scopedKey(_pinnedAudioItemsKey, serverId),
+          jsonEncode(migratedPinnedItems),
+        );
+      }
+      final legacyWholeLibraryPins = _readJsonList(
+        preferences.getString(_wholeLibraryPinnedAudioKey),
       );
-    }
-    for (final key in _profileKeys) {
-      await preferences.remove(key);
-    }
+      if (legacyWholeLibraryPins.isNotEmpty) {
+        await preferences.setString(
+          _scopedKey(_wholeLibraryPinnedAudioKey, serverId),
+          jsonEncode(
+            legacyWholeLibraryPins
+                .map((entry) =>
+                    _audioKeyForStreamUrl(entry.toString(), serverId))
+                .toSet()
+                .toList(),
+          ),
+        );
+      }
+      for (final key in _profileKeys) {
+        await preferences.remove(key);
+      }
+    });
   }
 
   /// Deletes all local data belonging to one saved server.
-  Future<void> clearScope(String serverId) async {
-    await _clearAudioCacheForScope(serverId);
-    final preferences = await SharedPreferences.getInstance();
-    for (final key in _profileKeys) {
-      await preferences.remove(_scopedKey(key, serverId));
-    }
+  Future<void> clearScope(String serverId) {
+    _invalidateDownloads(serverId);
+    return _serialized(() async {
+      await backgroundDownloads?.cancel(scope: serverId);
+      await _clearAudioCacheForScope(serverId);
+      final preferences = await SharedPreferences.getInstance();
+      for (final key in _profileKeys) {
+        await preferences.remove(_scopedKey(key, serverId));
+      }
+    });
   }
 
   /// Returns a stable cache identity for a stream in the active profile.
@@ -219,8 +290,6 @@ class CacheStore {
     }
     return segments[index + 1];
   }
-
-  String _key(String key, [String? scope]) => _scopedKey(key, scope ?? _scope);
 
   String _scopedKey(String key, String? scope) =>
       scope == null ? key : '$key.$scope';
@@ -397,29 +466,31 @@ class CacheStore {
       _saveList(_playHistoryKey, tracks);
 
   /// Persists the last known playback state for resume.
-  Future<void> savePlaybackResumeState(PlaybackResumeState? state) async {
-    final scope = _scope;
-    final preferences = await SharedPreferences.getInstance();
-    if (state == null) {
-      await preferences.remove(_key(_playbackResumeKey, scope));
-      return;
-    }
-    await preferences.setString(
-      _key(_playbackResumeKey, scope),
-      jsonEncode(state.toJson()),
-    );
+  Future<void> savePlaybackResumeState(PlaybackResumeState? state) {
+    final storageKey = _scopedKey(_playbackResumeKey, _scope);
+    return _serialized(() async {
+      final preferences = await SharedPreferences.getInstance();
+      if (state == null) {
+        await preferences.remove(storageKey);
+      } else {
+        await preferences.setString(storageKey, jsonEncode(state.toJson()));
+      }
+    });
   }
 
   /// Loads the last known playback state for resume.
-  Future<PlaybackResumeState?> loadPlaybackResumeState() async {
-    final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(_key(_playbackResumeKey));
-    if (raw == null || raw.isEmpty) {
-      return null;
-    }
-    return PlaybackResumeState.fromJson(
-      jsonDecode(raw) as Map<String, dynamic>,
-    );
+  Future<PlaybackResumeState?> loadPlaybackResumeState() {
+    final storageKey = _scopedKey(_playbackResumeKey, _scope);
+    return _serialized(() async {
+      final preferences = await SharedPreferences.getInstance();
+      final raw = preferences.getString(storageKey);
+      if (raw == null || raw.isEmpty) {
+        return null;
+      }
+      return PlaybackResumeState.fromJson(
+        jsonDecode(raw) as Map<String, dynamic>,
+      );
+    });
   }
 
   /// Loads cached playback history.
@@ -427,62 +498,83 @@ class CacheStore {
       _loadList(_playHistoryKey, MediaItem.fromJson);
 
   /// Persists library statistics for the home screen.
-  Future<void> saveLibraryStats(LibraryStats stats) async {
+  Future<void> saveLibraryStats(LibraryStats stats) {
     final scope = _scope;
-    final preferences = await SharedPreferences.getInstance();
-    await preferences.setString(
-      _key(_libraryStatsKey, scope),
-      jsonEncode(stats.toJson()),
-    );
+    return _serialized(() async {
+      final preferences = await SharedPreferences.getInstance();
+      await preferences.setString(
+        _scopedKey(_libraryStatsKey, scope),
+        jsonEncode(stats.toJson()),
+      );
+    });
   }
 
   /// Loads cached library stats.
-  Future<LibraryStats?> loadLibraryStats() async {
-    final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(_key(_libraryStatsKey));
-    if (raw == null || raw.isEmpty) {
-      return null;
-    }
-    return LibraryStats.fromJson(
-      jsonDecode(raw) as Map<String, dynamic>,
-    );
+  Future<LibraryStats?> loadLibraryStats() {
+    final storageKey = _scopedKey(_libraryStatsKey, _scope);
+    return _serialized(() async {
+      final preferences = await SharedPreferences.getInstance();
+      final raw = preferences.getString(storageKey);
+      if (raw == null || raw.isEmpty) {
+        return null;
+      }
+      return LibraryStats.fromJson(
+        jsonDecode(raw) as Map<String, dynamic>,
+      );
+    });
   }
 
   /// Returns a cached audio file if present.
-  Future<File?> getCachedAudio(MediaItem item, {bool touch = false}) async {
+  Future<File?> getCachedAudio(MediaItem item, {bool touch = false}) {
     final scope = _scope;
-    final cached = await _getAudioCacheInfoForItem(item, scope: scope);
-    if (touch && cached != null) {
-      await _rememberCachedAudio(item, scope: scope);
-    }
-    return cached?.file;
+    return _serialized(() async {
+      final cached = await _getAudioCacheInfoForItem(item, scope: scope);
+      if (touch && cached != null) {
+        await _rememberCachedAudio(item, scope: scope);
+      }
+      return cached?.file;
+    });
   }
 
   /// Returns true when the audio is cached on disk.
-  Future<bool> isAudioCached(MediaItem item) async {
+  Future<bool> isAudioCached(MediaItem item) {
     final scope = _scope;
-    final cached = await _getAudioCacheInfoForItem(item, scope: scope);
-    return cached != null;
+    return _serialized(() async {
+      final cached = await _getAudioCacheInfoForItem(item, scope: scope);
+      return cached != null;
+    });
+  }
+
+  Future<void> saveDownloadQueue(List<DownloadTask> tasks) =>
+      _saveList(_downloadQueueKey, tasks.map((task) => task.toJson()).toList());
+
+  Future<List<DownloadTask>> loadDownloadQueue() {
+    final scope = _scope;
+    return _serialized(() async {
+      final preferences = await SharedPreferences.getInstance();
+      return _readJsonList(
+              preferences.getString(_scopedKey(_downloadQueueKey, scope)))
+          .map((value) =>
+              DownloadTask.fromJson(Map<String, dynamic>.from(value as Map)))
+          .toList();
+    });
   }
 
   /// Downloads audio for offline-ready playback.
   Future<void> prefetchAudio(
     MediaItem item, {
     Map<String, String>? headers,
+    bool requiresWifi = false,
   }) async {
-    final scope = _scope;
-    final cacheKey = _audioKeyForStreamUrl(item.streamUrl, scope);
     try {
-      await _audioCache.downloadFile(
-        item.streamUrl,
-        key: cacheKey,
-        authHeaders: headers,
-      );
-      await _rememberCachedAudio(item, scope: scope);
-      await enforceCacheLimit(scope: scope);
-    } catch (e) {
+      await downloadAudioWithProgress(item,
+              headers: headers, requiresWifi: requiresWifi)
+          .drain<void>();
+    } on CacheDownloadCancelled {
+      // Intentional cleanup is not a prefetch failure.
+    } catch (error) {
       final log = await LogService.instance;
-      await log.warning('prefetchAudio failed for "${item.title}": $e');
+      await log.warning('prefetchAudio failed for "${item.title}": $error');
     }
   }
 
@@ -490,37 +582,128 @@ class CacheStore {
   Stream<FileResponse> downloadAudioWithProgress(
     MediaItem item, {
     Map<String, String>? headers,
-  }) =>
-      _downloadAudioWithProgress(item, headers: headers, scope: _scope);
+    bool requiresWifi = false,
+    bool userInitiated = false,
+    bool requirePin = false,
+  }) {
+    final scope = _scope;
+    final key = _audioKeyForStreamUrl(item.streamUrl, scope);
+    final previous = _audioDownloads
+        .where((download) => download.cacheKey == key)
+        .map((download) => download.finished.future)
+        .toList();
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _downloadOrder = now > _downloadOrder ? now : _downloadOrder + 1;
+    final download = _AudioDownload(
+        scope, key, DateTime.fromMillisecondsSinceEpoch(_downloadOrder));
+    final controller = StreamController<FileResponse>();
+    controller.onCancel = () {
+      unawaited(controller.close());
+    };
+    _audioDownloads.add(download);
+    unawaited(_downloadAudio(
+        item,
+        headers == null ? null : Map.of(headers),
+        download,
+        previous,
+        controller,
+        requiresWifi,
+        userInitiated,
+        requirePin));
+    return controller.stream;
+  }
 
-  Stream<FileResponse> _downloadAudioWithProgress(
-    MediaItem item, {
-    required String? scope,
+  Future<void> _downloadAudio(
+    MediaItem item,
     Map<String, String>? headers,
-  }) async* {
-    final stream = _audioCache.getFileStream(
-      item.streamUrl,
-      key: _audioKeyForStreamUrl(item.streamUrl, scope),
-      headers: headers,
-      withProgress: true,
-    );
-    await for (final response in stream) {
-      if (response is FileInfo) {
-        await _rememberCachedAudio(item, scope: scope);
-        await enforceCacheLimit(scope: scope);
+    _AudioDownload download,
+    List<Future<void>> previous,
+    StreamController<FileResponse> controller,
+    bool requiresWifi,
+    bool userInitiated,
+    bool requirePin,
+  ) async {
+    try {
+      // A new request must not join an invalidated cache-manager transfer.
+      await Future.wait(previous);
+      await _serialized(() async {});
+      if (download.invalidated) throw const CacheDownloadCancelled();
+      if (requirePin &&
+          !(await _serialized(() => _loadPinnedAudio(scope: download.scope)))
+              .contains(download.cacheKey)) {
+        throw const CacheDownloadCancelled();
       }
-      yield response;
+      final retained = await _serialized(
+          () => _getAudioCacheInfoForItem(item, scope: download.scope));
+      if (download.invalidated) throw const CacheDownloadCancelled();
+      if (retained != null) {
+        if (!download.invalidated && !controller.isClosed) {
+          controller.add(retained);
+        }
+        return;
+      }
+      final responses = backgroundDownloads?.download(
+              download.cacheKey, item.streamUrl,
+              scope: download.scope,
+              title: item.title,
+              headers: headers,
+              mediaItem: item.toJson(),
+              creationTime: download.createdAt,
+              requiresWifi: requiresWifi,
+              userInitiated: userInitiated) ??
+          _audioCache.getFileStream(
+            item.streamUrl,
+            key: download.cacheKey,
+            headers: headers,
+            withProgress: true,
+          );
+      await for (final response in responses) {
+        FileResponse result = response;
+        if (response is FileInfo) {
+          await _serialized(() async {
+            if (download.invalidated) {
+              await _deleteAudioFile(download.cacheKey);
+              return;
+            }
+            final retained = await _retainAudio(download.cacheKey, response);
+            result = CachedAudioFile(retained, await retained.file.length());
+            await _rememberCachedAudio(item, scope: download.scope);
+            // Pinned files do not consume the disposable cache budget.
+            if (!(await _loadPinnedAudio(scope: download.scope))
+                .contains(download.cacheKey)) {
+              await _enforceCacheLimit(download.scope);
+            }
+          });
+        }
+        if (!download.invalidated && !controller.isClosed) {
+          controller.add(result);
+        }
+      }
+      if (download.invalidated) throw const CacheDownloadCancelled();
+    } catch (error, stackTrace) {
+      if (!controller.isClosed) {
+        controller.addError(
+            download.invalidated ? const CacheDownloadCancelled() : error,
+            stackTrace);
+      }
+    } finally {
+      _audioDownloads.remove(download);
+      download.finished.complete();
+      // Closing must not wait for a cancelled or paused UI subscription.
+      unawaited(controller.close());
     }
   }
 
   /// Updates the LRU timestamp for a cached track.
-  Future<void> touchCachedAudio(MediaItem item) async {
+  Future<void> touchCachedAudio(MediaItem item) {
     final scope = _scope;
-    final cached = await _getAudioCacheInfoForItem(item, scope: scope);
-    if (cached == null) {
-      return;
-    }
-    await _rememberCachedAudio(item, scope: scope);
+    return _serialized(() async {
+      final cached = await _getAudioCacheInfoForItem(item, scope: scope);
+      if (cached == null) {
+        return;
+      }
+      await _rememberCachedAudio(item, scope: scope);
+    });
   }
 
   /// Prefetches the next track in the queue, when available.
@@ -528,6 +711,7 @@ class CacheStore {
     List<MediaItem> queue,
     int currentIndex, {
     Map<String, String>? headers,
+    bool requiresWifi = false,
   }) async {
     final scope = _scope;
     final nextIndex = currentIndex + 1;
@@ -539,7 +723,7 @@ class CacheStore {
       return;
     }
     if (_scope != scope) return;
-    await prefetchAudio(next, headers: headers);
+    await prefetchAudio(next, headers: headers, requiresWifi: requiresWifi);
   }
 
   /// Handles cache updates when playback advances.
@@ -547,6 +731,7 @@ class CacheStore {
     List<MediaItem> queue,
     int currentIndex, {
     Map<String, String>? headers,
+    bool requiresWifi = false,
   }) async {
     if (currentIndex < 0 || currentIndex >= queue.length) {
       return;
@@ -555,13 +740,16 @@ class CacheStore {
     final current = queue[currentIndex];
     await touchCachedAudio(current);
     if (_scope != scope) return;
-    await prefetchNextFromQueue(queue, currentIndex, headers: headers);
+    await prefetchNextFromQueue(queue, currentIndex,
+        headers: headers, requiresWifi: requiresWifi);
   }
 
   /// Clears cached metadata for library lists and tracks.
-  Future<void> clearMetadata() async {
+  Future<void> clearMetadata() {
     final scope = _scope;
-    await _clearMetadataForScope(scope);
+    return _serialized(() async {
+      await _clearMetadataForScope(scope);
+    });
   }
 
   Future<void> _clearMetadataForScope(String? scope) async {
@@ -571,40 +759,68 @@ class CacheStore {
     }
   }
 
-  /// Clears cached audio files.
-  Future<void> clearAudioCache() async {
+  /// Clears disposable audio while preserving offline selections and files.
+  Future<void> clearAudioCache() {
     final scope = _scope;
-    await _clearAudioCacheForScope(scope);
+    return _serialized(() async {
+      final pinned = await _loadPinnedAudio(scope: scope);
+      for (final download in _audioDownloads.toList()) {
+        if (download.scope == scope && !pinned.contains(download.cacheKey)) {
+          download.invalidated = true;
+          await backgroundDownloads?.cancel(
+              scope: scope, key: download.cacheKey);
+        }
+      }
+      final entries = await _loadCachedAudioEntriesForScope(scope);
+      final removed = <String>{};
+      for (final entry in entries) {
+        if (pinned.contains(entry.cacheKey)) continue;
+        await _deleteAudioFile(entry.cacheKey,
+            legacyCacheKey: entry.legacyCacheKey);
+        removed.add(entry.cacheKey);
+      }
+      await _forgetCachedAudioEntries(removed, scope: scope);
+    });
   }
 
   Future<void> _clearAudioCacheForScope(String? scope) async {
     final entries = await _loadCachedAudioEntriesForScope(scope);
+    final keys = await _loadPinnedAudio(scope: scope);
+    keys.addAll(await backgroundDownloads?.keysForScope(scope) ?? {});
     for (final entry in entries) {
+      keys.remove(entry.cacheKey);
       await _deleteAudioFile(
         entry.cacheKey,
         legacyCacheKey: entry.legacyCacheKey,
       );
     }
+    for (final key in keys) {
+      await _deleteAudioFile(key);
+    }
     await _saveCachedAudioEntries(const {}, scope: scope);
   }
 
   /// Returns the approximate size of cached media on disk.
-  Future<int> getMediaCacheBytes() async {
+  Future<int> getMediaCacheBytes() {
     final scope = _scope;
-    final entries = await _loadCachedAudioEntriesForScope(scope);
-    return entries.fold<int>(0, (sum, entry) => sum + entry.bytes);
+    return _serialized(() async {
+      final entries = await _loadCachedAudioEntriesForScope(scope);
+      return entries.fold<int>(0, (sum, entry) => sum + entry.bytes);
+    });
   }
 
   /// Returns the total bytes used by pinned tracks.
-  Future<int> getPinnedMediaBytes(Set<String> pinnedAudio) async {
-    if (pinnedAudio.isEmpty) {
-      return 0;
-    }
+  Future<int> getPinnedMediaBytes(Set<String> pinnedAudio) {
     final scope = _scope;
-    final entries = await _loadCachedAudioEntriesForScope(scope);
-    return entries
-        .where((entry) => pinnedAudio.contains(entry.cacheKey))
-        .fold<int>(0, (sum, entry) => sum + entry.bytes);
+    return _serialized(() async {
+      if (pinnedAudio.isEmpty) {
+        return 0;
+      }
+      final entries = await _loadCachedAudioEntriesForScope(scope);
+      return entries
+          .where((entry) => pinnedAudio.contains(entry.cacheKey))
+          .fold<int>(0, (sum, entry) => sum + entry.bytes);
+    });
   }
 
   /// Loads the configured cache size limit.
@@ -619,27 +835,49 @@ class CacheStore {
   }
 
   /// Saves the configured cache size limit.
-  Future<void> saveCacheMaxBytes(int bytes) async {
-    final preferences = await SharedPreferences.getInstance();
-    await preferences.setInt(_cachedAudioLimitKey, bytes);
-    await enforceCacheLimit(maxBytes: bytes);
+  Future<void> saveCacheMaxBytes(int bytes) {
+    final scope = _scope;
+    return _serialized(() async {
+      final preferences = await SharedPreferences.getInstance();
+      await preferences.setInt(_cachedAudioLimitKey, bytes);
+      await _enforceCacheLimit(scope, maxBytes: bytes);
+    });
   }
 
   /// Returns a list of cached audio entries with metadata.
-  Future<List<CachedAudioEntry>> loadCachedAudioEntries() async {
+  Future<List<CachedAudioEntry>> loadCachedAudioEntries() {
     final scope = _scope;
-    return _loadCachedAudioEntriesForScope(scope);
+    return _serialized(() async {
+      return _loadCachedAudioEntriesForScope(scope);
+    });
   }
 
   Future<List<CachedAudioEntry>> _loadCachedAudioEntriesForScope(
     String? scope,
   ) async {
     final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(_key(_cachedAudioKey, scope));
-    if (raw == null || raw.isEmpty) {
-      return [];
+    final raw = preferences.getString(_scopedKey(_cachedAudioKey, scope));
+    final decoded = _readJsonMap(raw);
+    var recovered = false;
+    final pinnedItems = _readJsonMap(
+        preferences.getString(_scopedKey(_pinnedAudioItemsKey, scope)));
+    final completed = await backgroundDownloads?.completedMetadata(scope) ?? {};
+    pinnedItems.addAll(completed);
+    for (final pin in pinnedItems.entries) {
+      if (!decoded.containsKey(pin.key) &&
+          await _getAudioCacheInfo(pin.key) != null) {
+        final item = _mediaItemFromCachedPayload({'mediaItem': pin.value});
+        if (item == null) continue;
+        decoded[pin.key] = {
+          'title': item.title,
+          'album': item.album,
+          'artists': item.artists,
+          'mediaItem': item.toJson(),
+          'cachedAt': DateTime.now().toIso8601String()
+        };
+        recovered = true;
+      }
     }
-    final decoded = Map<String, dynamic>.from(jsonDecode(raw) as Map);
     final entries = <CachedAudioEntry>[];
     final toRemove = <String>[];
 
@@ -660,7 +898,14 @@ class CacheStore {
         toRemove.add(entry.key);
         continue;
       }
-      final bytes = await cacheInfo.file.length();
+      int bytes;
+      try {
+        bytes = await cacheInfo.file.length();
+      } on FileSystemException {
+        if (await cacheInfo.file.exists()) rethrow;
+        toRemove.add(entry.key);
+        continue;
+      }
       final mediaItem = _mediaItemFromCachedPayload(value);
       final artists = (value['artists'] as List<dynamic>? ?? const [])
           .map((artist) => artist.toString())
@@ -683,7 +928,7 @@ class CacheStore {
       );
     }
 
-    if (toRemove.isNotEmpty) {
+    if (toRemove.isNotEmpty || recovered) {
       for (final key in toRemove) {
         decoded.remove(key);
       }
@@ -695,22 +940,31 @@ class CacheStore {
   }
 
   /// Removes a cached audio entry and evicts the file.
-  Future<void> evictCachedAudio(String cacheKey) async {
+  Future<void> evictCachedAudio(String cacheKey) {
     final scope = _scope;
-    CachedAudioEntry? entry;
-    for (final candidate in await _loadCachedAudioEntriesForScope(scope)) {
-      if (candidate.cacheKey == cacheKey) {
-        entry = candidate;
-        break;
+    _invalidateDownloads(scope, cacheKey: cacheKey);
+    return _serialized(() async {
+      await backgroundDownloads?.cancel(scope: scope, key: cacheKey);
+      CachedAudioEntry? entry;
+      for (final candidate in await _loadCachedAudioEntriesForScope(scope)) {
+        if (candidate.cacheKey == cacheKey) {
+          entry = candidate;
+          break;
+        }
       }
-    }
-    await _deleteAudioFile(cacheKey, legacyCacheKey: entry?.legacyCacheKey);
-    await _forgetCachedAudio(cacheKey, scope: scope);
+      await _deleteAudioFile(cacheKey, legacyCacheKey: entry?.legacyCacheKey);
+      await _forgetCachedAudio(cacheKey, scope: scope);
+    });
   }
 
   /// Enforces the cache size limit using LRU eviction.
-  Future<void> enforceCacheLimit({int? maxBytes, String? scope}) async {
+  Future<void> enforceCacheLimit({int? maxBytes, String? scope}) {
     final cacheScope = scope ?? _scope;
+    return _serialized(
+        () => _enforceCacheLimit(cacheScope, maxBytes: maxBytes));
+  }
+
+  Future<void> _enforceCacheLimit(String? cacheScope, {int? maxBytes}) async {
     final limit = maxBytes ?? await loadCacheMaxBytes();
     if (limit <= 0) {
       return;
@@ -720,7 +974,9 @@ class CacheStore {
     if (entries.isEmpty) {
       return;
     }
-    var total = entries.fold<int>(0, (sum, entry) => sum + entry.bytes);
+    var total = entries
+        .where((entry) => !pinned.contains(entry.cacheKey))
+        .fold<int>(0, (sum, entry) => sum + entry.bytes);
     if (total <= limit) {
       return;
     }
@@ -756,30 +1012,25 @@ class CacheStore {
     String? legacyCacheKey,
   }) async {
     for (final key in {cacheKey, if (legacyCacheKey != null) legacyCacheKey}) {
-      File? cachedFile;
-      try {
-        cachedFile = (await _getAudioCacheInfo(key))?.file;
-      } catch (_) {}
-      try {
-        await _audioCache.removeFile(key);
-      } catch (_) {}
-      if (cachedFile != null) {
+      final file = (await _getAudioCacheInfo(key))?.file;
+      if (file != null) {
         try {
-          if (await cachedFile.exists()) {
-            await cachedFile.delete();
-          }
-        } catch (_) {
-          // Ignore failures clearing the on-disk cache directory.
+          await file.delete();
+        } on FileSystemException {
+          if (await file.exists()) rethrow;
         }
       }
+      await _audioCache.removeFile(key);
+      await backgroundDownloads?.forget(key);
+      final directory = (await retainedAudioFile(key)).parent;
+      if (await directory.exists()) await directory.delete(recursive: true);
     }
   }
 
   /// Returns the directory used by the media cache.
   Future<Directory> getMediaCacheDirectory() async {
-    final baseDir = await getTemporaryDirectory();
-    final cacheKey = _audioCache.config.cacheKey;
-    return Directory('${baseDir.path}${Platform.pathSeparator}$cacheKey');
+    final baseDir = await getApplicationSupportDirectory();
+    return Directory('${baseDir.path}/offline_audio');
   }
 
   /// Opens the cached media directory in the OS file manager.
@@ -799,70 +1050,77 @@ class CacheStore {
     }
   }
 
-  Future<void> _saveList(String key, List<Object> items) async {
-    final storageKey = _key(key);
-    final preferences = await SharedPreferences.getInstance();
-    // jsonEncode calls each model's toJson method.
-    await preferences.setString(storageKey, jsonEncode(items));
+  Future<void> _saveList(String key, List<Object> items) {
+    final storageKey = _scopedKey(key, _scope);
+    final encoded = jsonEncode(items);
+    return _serialized(() async {
+      final preferences = await SharedPreferences.getInstance();
+      await preferences.setString(storageKey, encoded);
+    });
   }
 
   Future<List<T>> _loadList<T>(
     String key,
     T Function(Map<String, dynamic>) fromJson,
-  ) async {
-    final storageKey = _key(key);
-    final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(storageKey);
-    if (raw == null || raw.isEmpty) {
-      return [];
-    }
-    return (jsonDecode(raw) as List<dynamic>)
-        .map((entry) => fromJson(entry as Map<String, dynamic>))
-        .toList();
+  ) {
+    final storageKey = _scopedKey(key, _scope);
+    return _serialized(() async {
+      final preferences = await SharedPreferences.getInstance();
+      final raw = preferences.getString(storageKey);
+      if (raw == null || raw.isEmpty) return [];
+      return (jsonDecode(raw) as List<dynamic>)
+          .map((entry) => fromJson(entry as Map<String, dynamic>))
+          .toList();
+    });
   }
 
   Future<void> _saveTrackMap(
     String key,
     String id,
     List<MediaItem> tracks,
-  ) async {
+  ) {
     final scope = _scope;
-    final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(_key(key, scope));
-    final Map<String, dynamic> decoded = raw == null || raw.isEmpty
-        ? {}
-        : jsonDecode(raw) as Map<String, dynamic>;
-    decoded[id] = tracks.map((track) => track.toJson()).toList();
-    await preferences.setString(_key(key, scope), jsonEncode(decoded));
+    final encodedTracks = tracks.map((track) => track.toJson()).toList();
+    return _serialized(() async {
+      final preferences = await SharedPreferences.getInstance();
+      final raw = preferences.getString(_scopedKey(key, scope));
+      final Map<String, dynamic> decoded = raw == null || raw.isEmpty
+          ? {}
+          : jsonDecode(raw) as Map<String, dynamic>;
+      decoded[id] = encodedTracks;
+      await preferences.setString(_scopedKey(key, scope), jsonEncode(decoded));
+    });
   }
 
-  Future<List<MediaItem>> _loadTrackMap(String key, String id) async {
-    final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(_key(key));
-    if (raw == null || raw.isEmpty) {
-      return [];
-    }
-    final decoded = jsonDecode(raw) as Map<String, dynamic>;
-    final items = decoded[id] as List<dynamic>?;
-    if (items == null) {
-      return [];
-    }
-    return items
-        .map((entry) => MediaItem.fromJson(entry as Map<String, dynamic>))
-        .toList();
+  Future<List<MediaItem>> _loadTrackMap(String key, String id) {
+    final storageKey = _scopedKey(key, _scope);
+    return _serialized(() async {
+      final preferences = await SharedPreferences.getInstance();
+      final raw = preferences.getString(storageKey);
+      if (raw == null || raw.isEmpty) {
+        return [];
+      }
+      final decoded = jsonDecode(raw) as Map<String, dynamic>;
+      final items = decoded[id] as List<dynamic>?;
+      if (items == null) {
+        return [];
+      }
+      return items
+          .map((entry) => MediaItem.fromJson(entry as Map<String, dynamic>))
+          .toList();
+    });
   }
 
   Future<void> _rememberCachedAudio(
     MediaItem item, {
-    String? scope,
+    required String? scope,
   }) async {
-    final cacheScope = scope ?? _scope;
     final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(_key(_cachedAudioKey, cacheScope));
+    final raw = preferences.getString(_scopedKey(_cachedAudioKey, scope));
     final Map<String, dynamic> decoded = raw == null || raw.isEmpty
         ? {}
         : jsonDecode(raw) as Map<String, dynamic>;
-    final cacheKey = _audioKeyForStreamUrl(item.streamUrl, cacheScope);
+    final cacheKey = _audioKeyForStreamUrl(item.streamUrl, scope);
     final existing = decoded[cacheKey];
     decoded[cacheKey] = {
       if (existing is Map && existing[_legacyCacheKeyField] is String)
@@ -873,33 +1131,83 @@ class CacheStore {
       'mediaItem': item.toJson(),
       'cachedAt': DateTime.now().toIso8601String(),
     };
-    await _saveCachedAudioEntries(decoded, scope: cacheScope);
+    await _saveCachedAudioEntries(decoded, scope: scope);
+  }
+
+  Future<FileInfo> _retainAudio(String key, FileInfo source) async {
+    var destination = await retainedAudioFile(key);
+    if (source.file.path != destination.path && !await destination.exists()) {
+      final reader = await source.file.open();
+      String? mime;
+      try {
+        mime = lookupMimeType(source.file.path,
+            headerBytes: await reader.read(512));
+      } finally {
+        await reader.close();
+      }
+      final extension = switch (mime) {
+        'audio/mpeg' => 'mp3',
+        'audio/flac' || 'audio/x-flac' => 'flac',
+        'audio/ogg' || 'application/ogg' => 'ogg',
+        'audio/mp4' || 'video/mp4' => 'm4a',
+        'audio/aac' => 'aac',
+        'audio/wav' || 'audio/x-wav' => 'wav',
+        _ => 'bin',
+      };
+      destination = File('${destination.parent.path}/audio.$extension');
+      await destination.parent.create(recursive: true);
+      final partial = await source.file.copy('${destination.path}.part');
+      await partial.rename(destination.path);
+      await source.file.delete();
+    }
+    return FileInfo(const LocalFileSystem().file(destination.path),
+        source.source, source.validTill, source.originalUrl);
   }
 
   Future<FileInfo?> _getAudioCacheInfo(String cacheKey) async {
-    return _audioCache.getFileFromCache(cacheKey);
+    final file = await retainedAudioFile(cacheKey);
+    if (await file.exists()) {
+      return FileInfo(const LocalFileSystem().file(file.path), FileSource.Cache,
+          DateTime(2100), cacheKey);
+    }
+    final completed = await backgroundDownloads?.completedFile(cacheKey);
+    if (completed != null) return _retainAudio(cacheKey, completed);
+    final legacy = await _audioCache.getFileFromCache(cacheKey);
+    if (legacy == null) return null;
+    try {
+      return await _retainAudio(cacheKey, legacy);
+    } on FileSystemException {
+      if (await legacy.file.exists()) rethrow;
+      return null;
+    }
   }
 
   Future<FileInfo?> _getAudioCacheInfoForItem(
     MediaItem item, {
-    String? scope,
+    required String? scope,
   }) async {
-    final cacheScope = scope ?? _scope;
-    final cacheKey = _audioKeyForStreamUrl(item.streamUrl, cacheScope);
+    final cacheKey = _audioKeyForStreamUrl(item.streamUrl, scope);
+    if (_audioDownloads.any(
+        (download) => download.cacheKey == cacheKey && download.invalidated)) {
+      return null;
+    }
     final cached = await _getAudioCacheInfo(cacheKey);
     if (cached != null) {
-      return cached;
+      return _retainAudio(cacheKey, cached);
     }
     final entries = _readJsonMap(
       (await SharedPreferences.getInstance())
-          .getString(_key(_cachedAudioKey, cacheScope)),
+          .getString(_scopedKey(_cachedAudioKey, scope)),
     );
     final entry = entries[cacheKey];
     if (entry is! Map) {
       return null;
     }
     final legacyCacheKey = entry[_legacyCacheKeyField] as String?;
-    return legacyCacheKey == null ? null : _getAudioCacheInfo(legacyCacheKey);
+    final legacy = legacyCacheKey == null
+        ? null
+        : await _getAudioCacheInfo(legacyCacheKey);
+    return legacy == null ? null : _retainAudio(cacheKey, legacy);
   }
 
   MediaItem? _mediaItemFromCachedPayload(Map<String, dynamic> payload) {
@@ -914,25 +1222,12 @@ class CacheStore {
     }
   }
 
-  Future<void> _forgetCachedAudio(
-    String cacheKey, {
-    String? scope,
-  }) async {
-    final cacheScope = scope ?? _scope;
-    final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(_key(_cachedAudioKey, cacheScope));
-    if (raw == null || raw.isEmpty) {
-      return;
-    }
-    final decoded = jsonDecode(raw) as Map<String, dynamic>;
-    decoded.remove(cacheKey);
-    await _saveCachedAudioEntries(decoded, scope: cacheScope);
-  }
+  Future<void> _forgetCachedAudio(String cacheKey, {required String? scope}) =>
+      _forgetCachedAudioEntries({cacheKey}, scope: scope);
 
-  Future<Set<String>> _loadPinnedAudio({String? scope}) async {
-    final cacheScope = scope ?? _scope;
+  Future<Set<String>> _loadPinnedAudio({required String? scope}) async {
     final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(_key(_pinnedAudioKey, cacheScope));
+    final raw = preferences.getString(_scopedKey(_pinnedAudioKey, scope));
     if (raw == null || raw.isEmpty) {
       return {};
     }
@@ -940,24 +1235,23 @@ class CacheStore {
     return decoded.map((entry) => entry.toString()).toSet();
   }
 
-  Future<void> _savePinnedAudio(Set<String> urls, {String? scope}) async {
-    final cacheScope = scope ?? _scope;
+  Future<void> _savePinnedAudio(Set<String> urls,
+      {required String? scope}) async {
     final preferences = await SharedPreferences.getInstance();
     await preferences.setString(
-      _key(_pinnedAudioKey, cacheScope),
+      _scopedKey(_pinnedAudioKey, scope),
       jsonEncode(
-        urls
-            .map((url) => _audioKeyForStreamUrl(url, cacheScope))
-            .toSet()
-            .toList(),
+        urls.map((url) => _audioKeyForStreamUrl(url, scope)).toSet().toList(),
       ),
     );
   }
 
   /// Pins or unpins a cached track for offline use.
-  Future<void> setPinnedAudio(String streamUrl, bool pinned) async {
+  Future<void> setPinnedAudio(String streamUrl, bool pinned) {
     final scope = _scope;
-    await _setPinnedAudio(streamUrl, pinned, scope: scope);
+    return _serialized(() async {
+      await _setPinnedAudio(streamUrl, pinned, scope: scope);
+    });
   }
 
   Future<void> _setPinnedAudio(
@@ -971,138 +1265,175 @@ class CacheStore {
       current.add(cacheKey);
     } else {
       current.remove(cacheKey);
-      await _forgetPinnedAudioItem(cacheKey, scope: scope);
     }
     await _savePinnedAudio(current, scope: scope);
+    if (!pinned) await _forgetPinnedAudioItems({cacheKey}, scope: scope);
   }
 
   /// Pins or unpins a track and persists enough metadata to resume downloads.
-  Future<void> setPinnedAudioItem(MediaItem item, bool pinned) async {
+  Future<void> setPinnedAudioItem(MediaItem item, bool pinned) {
     final scope = _scope;
-    await _setPinnedAudio(item.streamUrl, pinned, scope: scope);
-    if (!pinned) {
-      return;
-    }
-    final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(_key(_pinnedAudioItemsKey, scope));
-    final Map<String, dynamic> decoded = raw == null || raw.isEmpty
-        ? {}
-        : jsonDecode(raw) as Map<String, dynamic>;
-    decoded[_audioKeyForStreamUrl(item.streamUrl, scope)] = item.toJson();
-    await preferences.setString(
-      _key(_pinnedAudioItemsKey, scope),
-      jsonEncode(decoded),
-    );
+    return _serialized(() async {
+      if (pinned) await _savePinnedAudioItems([item], scope: scope);
+      await _setPinnedAudio(item.streamUrl, pinned, scope: scope);
+    });
+  }
+
+  /// Applies a collection's pin intent without read/modify/write snapshots in
+  /// AppState or a full preferences rewrite for each song.
+  Future<Set<String>> updateOfflineSelection(List<MediaItem> items,
+      {required bool pinned, bool wholeLibrary = false}) {
+    final scope = _scope;
+    final snapshot = List<MediaItem>.of(items);
+    return _serialized(() async {
+      final pins = await _loadPinnedAudio(scope: scope);
+      final whole = await _loadWholeLibraryPinnedAudio(scope: scope);
+      final keys = snapshot
+          .map((item) => _audioKeyForStreamUrl(item.streamUrl, scope))
+          .toSet();
+      if (pinned) {
+        if (wholeLibrary) {
+          whole.addAll(keys.difference(pins));
+        } else {
+          whole.removeAll(keys);
+        }
+        await _savePinnedAudioItems(snapshot, scope: scope);
+        pins.addAll(keys);
+      } else {
+        for (final key in keys) {
+          _invalidateDownloads(scope, cacheKey: key);
+        }
+        await backgroundDownloads?.cancel(scope: scope, keys: keys);
+        pins.removeAll(keys);
+        whole.removeAll(keys);
+      }
+      await _savePinnedAudio(pins, scope: scope);
+      if (!pinned) await _forgetPinnedAudioItems(keys, scope: scope);
+      await _saveWholeLibraryPinnedAudio(whole, scope: scope);
+      if (!pinned) await _enforceCacheLimit(scope);
+      return whole;
+    });
+  }
+
+  Future<Set<String>> removeWholeLibrarySelection() {
+    final scope = _scope;
+    return _serialized(() async {
+      final whole = await _loadWholeLibraryPinnedAudio(scope: scope);
+      final pins = await _loadPinnedAudio(scope: scope);
+      for (final key in whole) {
+        _invalidateDownloads(scope, cacheKey: key);
+      }
+      await backgroundDownloads?.cancel(scope: scope, keys: whole);
+      await _savePinnedAudio(pins..removeAll(whole), scope: scope);
+      await _forgetPinnedAudioItems(whole, scope: scope);
+      await _saveWholeLibraryPinnedAudio({}, scope: scope);
+      await _enforceCacheLimit(scope);
+      return whole;
+    });
   }
 
   /// Returns whether a track is pinned for offline playback.
-  Future<bool> isPinnedAudio(String streamUrl) async {
+  Future<bool> isPinnedAudio(String streamUrl) {
     final scope = _scope;
-    final pinned = await _loadPinnedAudio(scope: scope);
-    return pinned.contains(_audioKeyForStreamUrl(streamUrl, scope));
+    return _serialized(() async {
+      final pinned = await _loadPinnedAudio(scope: scope);
+      return pinned.contains(_audioKeyForStreamUrl(streamUrl, scope));
+    });
   }
 
   /// Loads pinned cache keys for offline playback.
-  Future<Set<String>> loadPinnedAudio() async {
+  Future<Set<String>> loadPinnedAudio() {
     final scope = _scope;
-    return _loadPinnedAudio(scope: scope);
+    return _serialized(() async {
+      return _loadPinnedAudio(scope: scope);
+    });
   }
 
   /// Loads metadata for tracks that are pinned for offline playback.
-  Future<List<MediaItem>> loadPinnedAudioItems() async {
+  Future<List<MediaItem>> loadPinnedAudioItems() {
     final scope = _scope;
-    final pinned = await _loadPinnedAudio(scope: scope);
-    if (pinned.isEmpty) {
-      return [];
-    }
-    final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(_key(_pinnedAudioItemsKey, scope));
-    if (raw == null || raw.isEmpty) {
-      return [];
-    }
-    final decoded = jsonDecode(raw) as Map<String, dynamic>;
-    final items = <MediaItem>[];
-    final toRemove = <String>[];
-    for (final entry in decoded.entries) {
-      final value = entry.value;
-      if (value is! Map) {
-        toRemove.add(entry.key);
-        continue;
+    return _serialized(() async {
+      final pinned = await _loadPinnedAudio(scope: scope);
+      if (pinned.isEmpty) {
+        return [];
       }
-      try {
-        items.add(MediaItem.fromJson(value.cast<String, dynamic>()));
-      } catch (_) {
-        toRemove.add(entry.key);
+      final preferences = await SharedPreferences.getInstance();
+      final raw =
+          preferences.getString(_scopedKey(_pinnedAudioItemsKey, scope));
+      if (raw == null || raw.isEmpty) {
+        return [];
       }
-    }
-    if (toRemove.isNotEmpty) {
-      for (final key in toRemove) {
-        decoded.remove(key);
+      final decoded = jsonDecode(raw) as Map<String, dynamic>;
+      final items = <MediaItem>[];
+      final toRemove = <String>[];
+      for (final entry in decoded.entries) {
+        if (!pinned.contains(entry.key)) continue;
+        final value = entry.value;
+        if (value is! Map) {
+          toRemove.add(entry.key);
+          continue;
+        }
+        try {
+          items.add(MediaItem.fromJson(value.cast<String, dynamic>()));
+        } catch (_) {
+          toRemove.add(entry.key);
+        }
       }
-      await preferences.setString(
-        _key(_pinnedAudioItemsKey, scope),
-        jsonEncode(decoded),
-      );
-    }
-    return items;
+      if (toRemove.isNotEmpty) {
+        for (final key in toRemove) {
+          decoded.remove(key);
+        }
+        await preferences.setString(
+          _scopedKey(_pinnedAudioItemsKey, scope),
+          jsonEncode(decoded),
+        );
+      }
+      return items;
+    });
   }
 
   /// Saves metadata for pinned tracks in one pass.
-  Future<void> savePinnedAudioItems(Iterable<MediaItem> items) async {
+  Future<void> savePinnedAudioItems(Iterable<MediaItem> items) {
     final scope = _scope;
-    final normalized = items.toList(growable: false);
-    if (normalized.isEmpty) {
-      return;
-    }
+    final snapshot = items.toList(growable: false);
+    return _serialized(() => _savePinnedAudioItems(snapshot, scope: scope));
+  }
+
+  Future<void> _savePinnedAudioItems(Iterable<MediaItem> items,
+      {required String? scope}) async {
+    if (items.isEmpty) return;
     final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(_key(_pinnedAudioItemsKey, scope));
-    final Map<String, dynamic> decoded = raw == null || raw.isEmpty
-        ? {}
+    final raw = preferences.getString(_scopedKey(_pinnedAudioItemsKey, scope));
+    final decoded = raw == null || raw.isEmpty
+        ? <String, dynamic>{}
         : jsonDecode(raw) as Map<String, dynamic>;
-    for (final item in normalized) {
+    for (final item in items) {
       decoded[_audioKeyForStreamUrl(item.streamUrl, scope)] = item.toJson();
     }
     await preferences.setString(
-      _key(_pinnedAudioItemsKey, scope),
-      jsonEncode(decoded),
-    );
+        _scopedKey(_pinnedAudioItemsKey, scope), jsonEncode(decoded));
   }
 
   /// Replaces pinned cache keys, accepting legacy stream URLs.
-  Future<void> savePinnedAudio(Set<String> urls) async {
+  Future<void> savePinnedAudio(Set<String> urls) {
     final scope = _scope;
-    await _savePinnedAudio(urls, scope: scope);
+    final snapshot = Set<String>.of(urls);
+    return _serialized(() => _savePinnedAudio(snapshot, scope: scope));
   }
 
   /// Removes pinned track metadata in one pass.
-  Future<void> forgetPinnedAudioItems(Iterable<String> streamUrls) async {
+  Future<void> forgetPinnedAudioItems(Iterable<String> streamUrls) {
     final scope = _scope;
-    final urls = streamUrls
-        .map((streamUrl) => _audioKeyForStreamUrl(streamUrl, scope))
-        .toSet();
-    if (urls.isEmpty) {
-      return;
-    }
-    final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(_key(_pinnedAudioItemsKey, scope));
-    if (raw == null || raw.isEmpty) {
-      return;
-    }
-    final decoded = jsonDecode(raw) as Map<String, dynamic>;
-    for (final streamUrl in urls) {
-      decoded.remove(streamUrl);
-    }
-    await preferences.setString(
-      _key(_pinnedAudioItemsKey, scope),
-      jsonEncode(decoded),
-    );
+    final keys =
+        streamUrls.map((url) => _audioKeyForStreamUrl(url, scope)).toSet();
+    return _serialized(() => _forgetPinnedAudioItems(keys, scope: scope));
   }
 
-  Future<Set<String>> _loadWholeLibraryPinnedAudio({String? scope}) async {
-    final cacheScope = scope ?? _scope;
+  Future<Set<String>> _loadWholeLibraryPinnedAudio(
+      {required String? scope}) async {
     final preferences = await SharedPreferences.getInstance();
     final raw =
-        preferences.getString(_key(_wholeLibraryPinnedAudioKey, cacheScope));
+        preferences.getString(_scopedKey(_wholeLibraryPinnedAudioKey, scope));
     if (raw == null || raw.isEmpty) {
       return {};
     }
@@ -1112,15 +1443,14 @@ class CacheStore {
 
   Future<void> _saveWholeLibraryPinnedAudio(
     Set<String> urls, {
-    String? scope,
+    required String? scope,
   }) async {
-    final cacheScope = scope ?? _scope;
     final preferences = await SharedPreferences.getInstance();
     await preferences.setString(
-      _key(_wholeLibraryPinnedAudioKey, cacheScope),
+      _scopedKey(_wholeLibraryPinnedAudioKey, scope),
       jsonEncode(
         urls
-            .map((streamUrl) => _audioKeyForStreamUrl(streamUrl, cacheScope))
+            .map((streamUrl) => _audioKeyForStreamUrl(streamUrl, scope))
             .toSet()
             .toList(),
       ),
@@ -1128,58 +1458,59 @@ class CacheStore {
   }
 
   /// Tracks pins created by the whole-library offline action.
-  Future<void> setWholeLibraryPinnedAudio(String streamUrl, bool pinned) async {
+  Future<void> setWholeLibraryPinnedAudio(String streamUrl, bool pinned) {
     final scope = _scope;
-    final cacheKey = _audioKeyForStreamUrl(streamUrl, scope);
-    final current = await _loadWholeLibraryPinnedAudio(scope: scope);
-    if (pinned) {
-      current.add(cacheKey);
-    } else {
-      current.remove(cacheKey);
-    }
-    await _saveWholeLibraryPinnedAudio(current, scope: scope);
+    return _serialized(() async {
+      final cacheKey = _audioKeyForStreamUrl(streamUrl, scope);
+      final current = await _loadWholeLibraryPinnedAudio(scope: scope);
+      if (pinned) {
+        current.add(cacheKey);
+      } else {
+        current.remove(cacheKey);
+      }
+      await _saveWholeLibraryPinnedAudio(current, scope: scope);
+    });
   }
 
   /// Loads pins created by the whole-library offline action.
-  Future<Set<String>> loadWholeLibraryPinnedAudio() async {
+  Future<Set<String>> loadWholeLibraryPinnedAudio() {
     final scope = _scope;
-    return _loadWholeLibraryPinnedAudio(scope: scope);
+    return _serialized(() async {
+      return _loadWholeLibraryPinnedAudio(scope: scope);
+    });
   }
 
   /// Replaces the set of pins created by the whole-library offline action.
-  Future<void> saveWholeLibraryPinnedAudio(Set<String> urls) async {
+  Future<void> saveWholeLibraryPinnedAudio(Set<String> urls) {
     final scope = _scope;
-    await _saveWholeLibraryPinnedAudio(urls, scope: scope);
+    final snapshot = Set<String>.of(urls);
+    return _serialized(
+        () => _saveWholeLibraryPinnedAudio(snapshot, scope: scope));
   }
 
-  Future<void> _forgetPinnedAudioItem(
-    String streamUrl, {
-    String? scope,
-  }) async {
-    final cacheScope = scope ?? _scope;
+  Future<void> _forgetPinnedAudioItems(Set<String> keys,
+      {required String? scope}) async {
+    if (keys.isEmpty) return;
     final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(_key(_pinnedAudioItemsKey, cacheScope));
-    if (raw == null || raw.isEmpty) {
-      return;
-    }
+    final raw = preferences.getString(_scopedKey(_pinnedAudioItemsKey, scope));
+    if (raw == null || raw.isEmpty) return;
     final decoded = jsonDecode(raw) as Map<String, dynamic>;
-    decoded.remove(_audioKeyForStreamUrl(streamUrl, cacheScope));
+    for (final key in keys) {
+      decoded.remove(key);
+    }
     await preferences.setString(
-      _key(_pinnedAudioItemsKey, cacheScope),
-      jsonEncode(decoded),
-    );
+        _scopedKey(_pinnedAudioItemsKey, scope), jsonEncode(decoded));
   }
 
   Future<void> _forgetCachedAudioEntries(
     Set<String> streamUrls, {
-    String? scope,
+    required String? scope,
   }) async {
     if (streamUrls.isEmpty) {
       return;
     }
-    final cacheScope = scope ?? _scope;
     final preferences = await SharedPreferences.getInstance();
-    final raw = preferences.getString(_key(_cachedAudioKey, cacheScope));
+    final raw = preferences.getString(_scopedKey(_cachedAudioKey, scope));
     if (raw == null || raw.isEmpty) {
       return;
     }
@@ -1187,18 +1518,28 @@ class CacheStore {
     for (final url in streamUrls) {
       decoded.remove(url);
     }
-    await _saveCachedAudioEntries(decoded, scope: cacheScope);
+    await _saveCachedAudioEntries(decoded, scope: scope);
   }
 
   Future<void> _saveCachedAudioEntries(
     Map<String, dynamic> entries, {
-    String? scope,
+    required String? scope,
   }) async {
-    final cacheScope = scope ?? _scope;
     final preferences = await SharedPreferences.getInstance();
     await preferences.setString(
-      _key(_cachedAudioKey, cacheScope),
+      _scopedKey(_cachedAudioKey, scope),
       jsonEncode(entries),
     );
   }
+}
+
+// Cache-manager transfers outlive stream listeners; retain ownership until done.
+class _AudioDownload {
+  _AudioDownload(this.scope, this.cacheKey, this.createdAt);
+
+  final String? scope;
+  final String cacheKey;
+  final DateTime createdAt;
+  final finished = Completer<void>();
+  bool invalidated = false;
 }

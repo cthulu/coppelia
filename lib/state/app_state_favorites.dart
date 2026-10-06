@@ -42,6 +42,7 @@ extension AppStateFavoritesExtension on AppState {
       await makeAlbumAvailableOffline(
         album,
         requiresWifi: _autoDownloadFavoritesWifiOnly,
+        userInitiated: false,
       );
       return;
     }
@@ -59,6 +60,7 @@ extension AppStateFavoritesExtension on AppState {
       await makeArtistAvailableOffline(
         artist,
         requiresWifi: _autoDownloadFavoritesWifiOnly,
+        userInitiated: false,
       );
       return;
     }
@@ -76,6 +78,7 @@ extension AppStateFavoritesExtension on AppState {
       await makeTrackAvailableOffline(
         track,
         requiresWifi: _autoDownloadFavoritesWifiOnly,
+        userInitiated: false,
       );
       return;
     }

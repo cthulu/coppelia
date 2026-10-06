@@ -8,6 +8,7 @@ import UIKit
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
     GeneratedPluginRegistrant.register(with: self)
+    UNUserNotificationCenter.current().delegate = self
     if let registrar = self.registrar(forPlugin: "NowPlayingPlugin") {
       NowPlayingPlugin.register(with: registrar)
     }

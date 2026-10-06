@@ -18,7 +18,7 @@ class GenreDetailView extends StatelessWidget {
       return const SizedBox.shrink();
     }
     final offlineTracks =
-        state.genreTracks.where(state.isTrackPinnedInMemory).toList();
+        state.genreTracks.where(state.isTrackAvailableOffline).toList();
     final displayTracks =
         state.offlineOnlyFilter ? offlineTracks : state.genreTracks;
 

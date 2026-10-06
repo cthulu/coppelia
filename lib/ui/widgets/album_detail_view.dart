@@ -47,10 +47,11 @@ class AlbumDetailView extends StatelessWidget {
     final isFavorite = state.isFavoriteAlbum(album.id);
     final isFavoriteUpdating = state.isFavoriteAlbumUpdating(album.id);
     final offlineTracks =
-        state.albumTracks.where(state.isTrackPinnedInMemory).toList();
+        state.albumTracks.where(state.isTrackAvailableOffline).toList();
     final offlineState = CollectionOfflineActionState.forTracks(
       tracks: state.albumTracks,
-      isTrackPinned: state.isTrackPinnedInMemory,
+      isTrackAvailable: state.isTrackAvailableOffline,
+      trackKey: state.trackCacheKey,
       downloadQueue: state.downloadQueue,
     );
     final displayTracks =

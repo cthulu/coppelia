@@ -31,6 +31,10 @@ dependencies:
     window_manager: ^0.3.8
     url_launcher: ^6.3.0
     audio_service_mpris: ^0.2.0
+    background_downloader: ^9.5.9
+    file: ^7.0.1
+    mime: ^2.1.0
+    crypto: ^3.0.7
 
 dev_dependencies:
     flutter_lints: ^3.0.0

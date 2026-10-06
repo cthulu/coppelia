@@ -1144,10 +1144,6 @@ class _CacheSettingsState extends State<_CacheSettings> {
     return 'Show in folder';
   }
 
-  String _formatCacheLimit(int bytes) {
-    return bytes <= 0 ? 'Unlimited' : formatBytes(bytes);
-  }
-
   String _wholeLibrarySubtitle() {
     final session = widget.state.session;
     if (session == null) {
@@ -1172,11 +1168,10 @@ class _CacheSettingsState extends State<_CacheSettings> {
       Duration.zero,
       () => widget.state.prepareWholeLibraryOfflinePreview(),
     );
-    final decision = await showDialog<_WholeLibraryDownloadDecision>(
+    final decision = await showDialog<WholeLibraryOfflinePreview>(
       context: context,
       builder: (context) => _WholeLibraryDownloadDialog(
         previewFuture: previewFuture,
-        formatCacheLimit: _formatCacheLimit,
       ),
     );
     if (decision == null || !mounted) {
@@ -1187,13 +1182,8 @@ class _CacheSettingsState extends State<_CacheSettings> {
       _isApplyingWholeLibraryAction = true;
     });
     try {
-      final expandedCacheToUnlimited =
-          decision.expandCacheToUnlimited && decision.preview.cacheMaxBytes > 0;
-      if (expandedCacheToUnlimited) {
-        await widget.state.setCacheMaxBytes(0);
-      }
       final result = await widget.state.makeWholeLibraryAvailableOffline(
-        decision.preview.tracks,
+        decision.tracks,
       );
       _refreshCacheUsage();
       await _refreshWholeLibraryStatus();
@@ -1203,16 +1193,14 @@ class _CacheSettingsState extends State<_CacheSettings> {
       if (result.newlyQueuedCount > 0 || result.retriedFailedCount > 0) {
         final queuedCount = result.newlyQueuedCount + result.retriedFailedCount;
         widget.onSnack(
-          'Queued ${formatCount(queuedCount)} tracks from your library.'
-          '${expandedCacheToUnlimited ? ' Cache limit set to Unlimited.' : ''}',
+          'Queued ${formatCount(queuedCount)} tracks from your library.',
         );
         return;
       }
       if (result.newlyPinnedCount > 0) {
         widget.onSnack(
           'Pinned ${formatCount(result.newlyPinnedCount)} library tracks for '
-          'offline playback.'
-          '${expandedCacheToUnlimited ? ' Cache limit set to Unlimited.' : ''}',
+          'offline playback.',
         );
         return;
       }
@@ -1312,12 +1300,17 @@ class _CacheSettingsState extends State<_CacheSettings> {
         SizedBox(height: space(12)),
         _SettingRow(
           title: 'Cache limit',
-          subtitle: 'Maximum disk space for cached audio.',
+          subtitle:
+              'Temporary audio limit; offline downloads are kept separately.',
           trailing: _CacheLimitPicker(
             currentBytes: widget.state.cacheMaxBytes,
             options: _cacheLimitOptions,
             onChanged: (bytes) async {
-              final currentBytes = await widget.state.getMediaCacheBytes();
+              await widget.state.refreshMediaCacheBytes();
+              if (!mounted) return;
+              final currentBytes =
+                  widget.state.mediaCacheBytesListenable.value -
+                      widget.state.pinnedCacheBytesListenable.value;
               final shouldTrim = await _confirmCacheTrim(
                 currentBytes: currentBytes,
                 targetBytes: bytes,
@@ -1342,8 +1335,7 @@ class _CacheSettingsState extends State<_CacheSettings> {
               return const SizedBox.shrink();
             }
             return Text(
-              'Pinned downloads use ${formatBytes(pinnedBytes)} and may exceed '
-              'the cache limit; unpinned tracks are evicted first.',
+              'Offline downloads use ${formatBytes(pinnedBytes)} in addition to the temporary cache.',
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
                     color: ColorTokens.textSecondary(context, 0.7),
                   ),
@@ -1492,7 +1484,7 @@ class _CacheSettingsState extends State<_CacheSettings> {
         SizedBox(height: space(12)),
         _SettingRow(
           title: 'Cached audio',
-          subtitle: 'Remove downloaded audio files.',
+          subtitle: 'Remove temporary audio; keep offline downloads.',
           trailing: OutlinedButton(
             onPressed: () async {
               await widget.state.clearAudioCache();
@@ -1509,48 +1501,20 @@ class _CacheSettingsState extends State<_CacheSettings> {
   }
 }
 
-class _WholeLibraryDownloadDecision {
-  const _WholeLibraryDownloadDecision({
-    required this.preview,
-    required this.expandCacheToUnlimited,
-  });
-
-  final WholeLibraryOfflinePreview preview;
-  final bool expandCacheToUnlimited;
-}
-
-class _WholeLibraryDownloadDialog extends StatefulWidget {
-  const _WholeLibraryDownloadDialog({
-    required this.previewFuture,
-    required this.formatCacheLimit,
-  });
+class _WholeLibraryDownloadDialog extends StatelessWidget {
+  const _WholeLibraryDownloadDialog({required this.previewFuture});
 
   final Future<WholeLibraryOfflinePreview?> previewFuture;
-  final String Function(int bytes) formatCacheLimit;
-
-  @override
-  State<_WholeLibraryDownloadDialog> createState() =>
-      _WholeLibraryDownloadDialogState();
-}
-
-class _WholeLibraryDownloadDialogState
-    extends State<_WholeLibraryDownloadDialog> {
-  bool _expandCacheToUnlimited = false;
 
   @override
   Widget build(BuildContext context) {
     return FutureBuilder<WholeLibraryOfflinePreview?>(
-      future: widget.previewFuture,
+      future: previewFuture,
       builder: (context, snapshot) {
         final preview = snapshot.data;
         final canConfirm = snapshot.connectionState == ConnectionState.done &&
             preview != null &&
             preview.trackCount > 0;
-        final shouldOfferUnlimitedCache =
-            preview?.shouldOfferUnlimitedCache ?? false;
-        final expandCacheToUnlimited =
-            shouldOfferUnlimitedCache && _expandCacheToUnlimited;
-
         return AlertDialog(
           title: const Text('Download whole library?'),
           content: SingleChildScrollView(
@@ -1558,7 +1522,6 @@ class _WholeLibraryDownloadDialogState
               context,
               snapshot: snapshot,
               preview: preview,
-              shouldOfferUnlimitedCache: shouldOfferUnlimitedCache,
             ),
           ),
           actions: [
@@ -1570,10 +1533,7 @@ class _WholeLibraryDownloadDialogState
               onPressed: canConfirm
                   ? () {
                       Navigator.of(context).pop(
-                        _WholeLibraryDownloadDecision(
-                          preview: preview,
-                          expandCacheToUnlimited: expandCacheToUnlimited,
-                        ),
+                        preview,
                       );
                     }
                   : null,
@@ -1589,7 +1549,6 @@ class _WholeLibraryDownloadDialogState
     BuildContext context, {
     required AsyncSnapshot<WholeLibraryOfflinePreview?> snapshot,
     required WholeLibraryOfflinePreview? preview,
-    required bool shouldOfferUnlimitedCache,
   }) {
     if (snapshot.connectionState != ConnectionState.done) {
       return Row(
@@ -1659,19 +1618,9 @@ class _WholeLibraryDownloadDialogState
     }
 
     content.add(const SizedBox(height: 12));
-    content.add(
-      Text(
-        'Your cache limit is ${widget.formatCacheLimit(preview.cacheMaxBytes)} '
-        'right now.',
-      ),
-    );
-    content.add(const SizedBox(height: 8));
-    content.add(
-      Text(
-        'Pinned downloads can exceed that limit; unpinned tracks are evicted first.',
-        style: secondaryStyle,
-      ),
-    );
+    content.add(Text(
+        'Offline downloads are kept separately from the temporary cache.',
+        style: secondaryStyle));
 
     if (preview.wholeLibraryPinnedTrackCount > 0) {
       content.add(const SizedBox(height: 8));
@@ -1700,23 +1649,6 @@ class _WholeLibraryDownloadDialogState
         Text(
           'Downloads are paused right now, so everything will queue but not start yet.',
           style: secondaryStyle,
-        ),
-      );
-    }
-
-    if (shouldOfferUnlimitedCache) {
-      content.add(const SizedBox(height: 12));
-      content.add(
-        CheckboxListTile(
-          value: _expandCacheToUnlimited,
-          contentPadding: EdgeInsets.zero,
-          controlAffinity: ListTileControlAffinity.leading,
-          onChanged: (value) {
-            setState(() {
-              _expandCacheToUnlimited = value ?? false;
-            });
-          },
-          title: const Text('Set cache limit to Unlimited before starting'),
         ),
       );
     }
@@ -1846,9 +1778,11 @@ class _DownloadQueueList extends StatelessWidget {
           queued += 1;
           break;
         case DownloadStatus.waitingForWifi:
+        case DownloadStatus.waitingToRetry:
           waiting += 1;
           break;
         case DownloadStatus.failed:
+        case DownloadStatus.stopped:
           failed += 1;
           break;
       }
@@ -1999,7 +1933,8 @@ class _DownloadQueueRow extends StatelessWidget {
                 style: Theme.of(context).textTheme.bodyMedium,
               ),
             ),
-            if (task.status == DownloadStatus.failed) ...[
+            if (task.status == DownloadStatus.failed ||
+                task.status == DownloadStatus.stopped) ...[
               const SizedBox(width: 6),
               IconButton(
                 onPressed: onRetry,
@@ -2026,8 +1961,10 @@ class _DownloadQueueRow extends StatelessWidget {
       return 'Waiting for Wi-Fi';
     }
     if (task.status == DownloadStatus.failed) {
-      return 'Failed';
+      return task.errorMessage ?? 'Failed';
     }
+    if (task.status == DownloadStatus.waitingToRetry) return 'Retrying shortly';
+    if (task.status == DownloadStatus.stopped) return 'Stopped';
     return 'Queued';
   }
 }

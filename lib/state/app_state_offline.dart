@@ -1,10 +1,101 @@
 part of 'app_state.dart';
 
 extension AppStateOfflineExtension on AppState {
+  void _scheduleDownloadSave() {
+    _downloadSaveTimer?.cancel();
+    _downloadSaveTimer = Timer(const Duration(milliseconds: 100), () {
+      unawaited(_cacheStore.saveDownloadQueue(List.of(_downloadQueue)));
+    });
+  }
+
+  void _scheduleCacheRefresh() {
+    _cacheRefreshTimer ??= Timer(const Duration(milliseconds: 500), () {
+      _cacheRefreshTimer = null;
+      if (_downloadQueue.isEmpty) {
+        unawaited(refreshMediaCacheBytes());
+      } else {
+        _offlineRevision += 1;
+        _notify();
+      }
+    });
+  }
+
+  void _scheduleRetryWakeup() {
+    _downloadRetryTimer?.cancel();
+    if (_downloadsPaused || _offlineMode) return;
+    final times = _downloadQueue
+        .where((task) => task.status == DownloadStatus.waitingToRetry)
+        .map((task) => task.retryAt ?? DateTime.now())
+        .toList()
+      ..sort();
+    if (times.isEmpty) return;
+    _downloadRetryTimer = Timer(times.first.difference(DateTime.now()), () {
+      unawaited(_processDownloadQueue());
+    });
+  }
+
+  Future<void> _recoverDownloads() async {
+    if (_recoveringDownloads || _session == null) return;
+    _recoveringDownloads = true;
+    final generation = _captureServerGeneration();
+    try {
+      await refreshMediaCacheBytes();
+      if (!_isCurrentServerGeneration(generation)) return;
+      for (var i = 0; i < _downloadQueue.length; i++) {
+        final task = _downloadQueue[i];
+        if (task.status == DownloadStatus.failed && task.retryableFailure) {
+          _replaceDownloadTaskAt(
+              i, task.reset(userInitiated: task.userInitiated));
+        }
+      }
+      await _resumePinnedDownloads();
+      if (!_isCurrentServerGeneration(generation)) return;
+      await _processDownloadQueue();
+    } finally {
+      _recoveringDownloads = false;
+    }
+  }
+
+  Future<void> _restoreDownloadQueue() async {
+    final generation = _captureServerGeneration();
+    await _cacheStore.backgroundDownloads?.activateScope(_activeServer?.id,
+        paused: _downloadsPaused || _offlineMode);
+    if (!_isCurrentServerGeneration(generation)) return;
+    final tasks = await _cacheStore.loadDownloadQueue();
+    if (!_isCurrentServerGeneration(generation)) return;
+    for (final task in tasks) {
+      final normalized =
+          task.copyWith(track: _normalizeTrackForPlayback(task.track));
+      final key = _audioKey(normalized.track.streamUrl);
+      if (!_pinnedAudio.contains(key)) continue;
+      final cached = await _cacheStore.isAudioCached(normalized.track);
+      if (!_isCurrentServerGeneration(generation)) return;
+      if (cached) continue;
+      final restored = await _cacheStore.backgroundDownloads
+              ?.restore(normalized, key, headers: _playbackHeaders()) ??
+          normalized;
+      if (!_isCurrentServerGeneration(generation)) return;
+      _addDownloadTask(restored.status == DownloadStatus.downloading
+          ? restored.copyWith(status: DownloadStatus.queued)
+          : restored);
+    }
+  }
+
+  void _bindDownloadRecovery() {
+    _connectivitySubscription ??=
+        Connectivity().onConnectivityChanged.listen((_) {
+      unawaited(_recoverDownloads());
+    }, onError: (Object _) {});
+    _downloadLifecycle ??= AppLifecycleListener(onResume: () {
+      unawaited(_recoverDownloads());
+    });
+  }
+
   /// Updates whether downloads are limited to Wi-Fi.
   Future<void> setDownloadsWifiOnly(bool enabled) async {
     _downloadsWifiOnly = enabled;
     await _settingsStore.saveDownloadsWifiOnly(enabled);
+    await _cacheStore.cancelDownloads();
     _notify();
     unawaited(_processDownloadQueue());
   }
@@ -13,6 +104,7 @@ extension AppStateOfflineExtension on AppState {
   Future<void> setDownloadsPaused(bool paused) async {
     _downloadsPaused = paused;
     await _settingsStore.saveDownloadsPaused(paused);
+    if (paused) await _cacheStore.cancelDownloads();
     _notify();
     if (!paused) {
       unawaited(_processDownloadQueue());
@@ -63,6 +155,14 @@ extension AppStateOfflineExtension on AppState {
   Future<void> setAutoDownloadFavoritesWifiOnly(bool enabled) async {
     _autoDownloadFavoritesWifiOnly = enabled;
     await _settingsStore.saveAutoDownloadFavoritesWifiOnly(enabled);
+    for (var i = 0; i < _downloadQueue.length; i++) {
+      final task = _downloadQueue[i];
+      if (!task.userInitiated) {
+        _replaceDownloadTaskAt(i, task.copyWith(requiresWifi: enabled));
+      }
+    }
+    _scheduleDownloadSave();
+    await _restartDownloadQueue();
     _notify();
     if (enabled && _autoDownloadFavoritesEnabled) {
       unawaited(_prefetchFavoriteDownloads());
@@ -83,23 +183,31 @@ extension AppStateOfflineExtension on AppState {
     final task = _downloadQueue.removeAt(oldIndex);
     final target = newIndex.clamp(0, _downloadQueue.length);
     _downloadQueue.insert(target, task);
+    _scheduleDownloadSave();
     _notify();
+    unawaited(_restartDownloadQueue());
+  }
+
+  Future<void> _restartDownloadQueue() async {
+    final generation = _captureServerGeneration();
+    await _cacheStore.cancelDownloads();
+    if (_isCurrentServerGeneration(generation)) await _processDownloadQueue();
   }
 
   /// Retries a failed download.
-  void retryDownload(DownloadTask task) {
+  Future<void> retryDownload(DownloadTask task) async {
+    if (_indexOfDownload(task.track.streamUrl) == null) return;
+    final generation = _captureServerGeneration();
+    await _cacheStore.backgroundDownloads
+        ?.prepareRetry(_audioKey(task.track.streamUrl));
+    if (!_isCurrentServerGeneration(generation)) return;
     final index = _indexOfDownload(task.track.streamUrl);
     if (index == null) {
       return;
     }
-    final queuedTask = _downloadQueue[index].copyWith(
-      status: DownloadStatus.queued,
-      progress: null,
-      totalBytes: null,
-      downloadedBytes: null,
-      errorMessage: null,
-    );
+    final queuedTask = _downloadQueue[index].reset();
     _replaceDownloadTaskAt(index, queuedTask);
+    _scheduleDownloadSave();
     _notify();
     unawaited(_processDownloadQueue());
   }
@@ -110,6 +218,9 @@ extension AppStateOfflineExtension on AppState {
       return;
     }
     _offlineMode = enabled;
+    _cacheStore.localPlaybackOnly = enabled;
+    if (enabled) await _restrictPlaybackToOffline();
+    if (enabled) await _cacheStore.cancelDownloads();
     await _settingsStore.saveOfflineMode(enabled);
     if (enabled) {
       await _applyOfflineModeData();
@@ -126,7 +237,42 @@ extension AppStateOfflineExtension on AppState {
     if (_session != null) {
       unawaited(refreshLibrary());
     }
-    unawaited(_processDownloadQueue());
+    unawaited(_recoverDownloads());
+  }
+
+  Future<void> _restrictPlaybackToOffline() async {
+    if (_queue.isEmpty) return;
+    final generation = _captureServerGeneration();
+    final requestId = ++_playRequestId;
+    bool isStale() =>
+        !_offlineMode ||
+        !_isCurrentServerGeneration(generation) ||
+        _isPlayRequestStale(requestId);
+    final tracks = List<MediaItem>.of(_queue);
+    final current = _nowPlaying;
+    final position = _position;
+    final wasPlaying = _isPlaying;
+    await _playback.clearQueue(keepCurrent: false);
+    if (isStale()) return;
+    await refreshMediaCacheBytes();
+    if (isStale()) return;
+    _queue = tracks.where(isTrackAvailableOffline).toList();
+    if (_queue.isEmpty) {
+      _resetPlaybackRuntimeState(clearNowPlaying: true, clearReporting: true);
+      unawaited(_nowPlayingService.clear());
+      return;
+    }
+    final index = _queue.indexWhere((track) => track.id == current?.id);
+    final nextIndex = index < 0 ? 0 : index;
+    final loaded = await _performPlaybackAction(
+        () => _playback.setQueue(_queue,
+            startIndex: nextIndex,
+            startPosition: index < 0 ? Duration.zero : position,
+            cacheStore: _cacheStore),
+        'load offline queue');
+    if (isStale() || !loaded) return;
+    _setNowPlaying(_queue[nextIndex], forceRestart: true);
+    if (wasPlaying && index >= 0) await _playback.play();
   }
 
   /// Updates the offline-only filter for detail views.
@@ -194,7 +340,6 @@ extension AppStateOfflineExtension on AppState {
       cachedTrackCount: cachedTrackCount,
       estimatedTotalBytes: estimatedTotalBytes,
       estimatedRemainingBytes: estimatedRemainingBytes,
-      cacheMaxBytes: _cacheMaxBytes,
       downloadsWifiOnly: _downloadsWifiOnly,
       downloadsPaused: _downloadsPaused,
       wholeLibraryPinnedTrackCount: wholeLibraryPinnedTrackCount,
@@ -219,18 +364,17 @@ extension AppStateOfflineExtension on AppState {
       return emptyResult;
     }
 
+    await _cacheStore.backgroundDownloads?.requestNotifications();
+    if (!_isCurrentServerGeneration(generation)) return emptyResult;
     final cachedEntries = await _cacheStore.loadCachedAudioEntries();
     if (!_isCurrentServerGeneration(generation)) return emptyResult;
     final cachedKeys = cachedEntries.map((entry) => entry.cacheKey).toSet();
     _cachedAudio = cachedKeys;
 
-    final nextPinnedAudio = Set<String>.from(_pinnedAudio);
-    final storedWholeLibraryPins =
-        await _cacheStore.loadWholeLibraryPinnedAudio();
-    if (!_isCurrentServerGeneration(generation)) return emptyResult;
     final nextWholeLibraryPinnedAudio =
-        Set<String>.from(storedWholeLibraryPins);
-    final pinnedItemsToSave = <MediaItem>[];
+        await _cacheStore.updateOfflineSelection(normalizedTracks,
+            pinned: true, wholeLibrary: true);
+    if (!_isCurrentServerGeneration(generation)) return emptyResult;
     var newlyPinnedCount = 0;
     var newlyQueuedCount = 0;
     var retriedFailedCount = 0;
@@ -239,13 +383,11 @@ extension AppStateOfflineExtension on AppState {
     for (final track in normalizedTracks) {
       final key = _audioKey(track.streamUrl);
       _cancelledOfflineRequests.remove(key);
-      final wasPinned = nextPinnedAudio.contains(key);
+      final wasPinned = _pinnedAudio.contains(key);
       if (wasPinned) {
         alreadyPinnedCount += 1;
       } else {
-        nextPinnedAudio.add(key);
-        nextWholeLibraryPinnedAudio.add(key);
-        pinnedItemsToSave.add(track);
+        _pinnedAudio.add(key);
         newlyPinnedCount += 1;
       }
 
@@ -256,17 +398,10 @@ extension AppStateOfflineExtension on AppState {
       final existingIndex = _indexOfDownload(track.streamUrl);
       if (existingIndex != null) {
         final existing = _downloadQueue[existingIndex];
-        if (existing.status == DownloadStatus.failed) {
-          _replaceDownloadTaskAt(
-            existingIndex,
-            existing.copyWith(
-              status: DownloadStatus.queued,
-              progress: null,
-              totalBytes: null,
-              downloadedBytes: null,
-              errorMessage: null,
-            ),
-          );
+        if (existing.status == DownloadStatus.failed ||
+            existing.status == DownloadStatus.stopped) {
+          await retryDownload(existing);
+          if (!_isCurrentServerGeneration(generation)) return emptyResult;
           retriedFailedCount += 1;
         }
         continue;
@@ -277,22 +412,13 @@ extension AppStateOfflineExtension on AppState {
           track: track,
           status: DownloadStatus.queued,
           queuedAt: DateTime.now(),
+          userInitiated: true,
         ),
       );
       newlyQueuedCount += 1;
     }
 
     if (!_isCurrentServerGeneration(generation)) return emptyResult;
-    _pinnedAudio = nextPinnedAudio;
-    await _cacheStore.savePinnedAudio(_pinnedAudio);
-    if (!_isCurrentServerGeneration(generation)) return emptyResult;
-    if (pinnedItemsToSave.isNotEmpty) {
-      await _cacheStore.savePinnedAudioItems(pinnedItemsToSave);
-      if (!_isCurrentServerGeneration(generation)) return emptyResult;
-    }
-    await _cacheStore.saveWholeLibraryPinnedAudio(nextWholeLibraryPinnedAudio);
-    if (!_isCurrentServerGeneration(generation)) return emptyResult;
-
     _refreshSelectedSmartList();
     unawaited(refreshMediaCacheBytes());
     _notify();
@@ -313,9 +439,11 @@ extension AppStateOfflineExtension on AppState {
   /// Removes the tracked whole-library offline selection.
   Future<WholeLibraryOfflineRemovalResult>
       removeWholeLibraryOfflineSelection() async {
+    final generation = _captureServerGeneration();
     final wholeLibraryPinnedAudio =
-        await _cacheStore.loadWholeLibraryPinnedAudio();
-    if (wholeLibraryPinnedAudio.isEmpty) {
+        await _cacheStore.removeWholeLibrarySelection();
+    if (!_isCurrentServerGeneration(generation) ||
+        wholeLibraryPinnedAudio.isEmpty) {
       return const WholeLibraryOfflineRemovalResult(removedTrackCount: 0);
     }
 
@@ -329,9 +457,7 @@ extension AppStateOfflineExtension on AppState {
         .removeWhere((key, _) => keysToRemove.contains(key));
     _cancelledOfflineRequests.addAll(keysToRemove);
 
-    await _cacheStore.savePinnedAudio(_pinnedAudio);
-    await _cacheStore.forgetPinnedAudioItems(keysToRemove);
-    await _cacheStore.saveWholeLibraryPinnedAudio(<String>{});
+    _scheduleDownloadSave();
 
     _refreshSelectedSmartList();
     unawaited(refreshMediaCacheBytes());
@@ -392,6 +518,7 @@ extension AppStateOfflineExtension on AppState {
         await makeAlbumAvailableOffline(
           album,
           requiresWifi: _autoDownloadFavoritesWifiOnly,
+          userInitiated: false,
         );
       }
     }
@@ -401,6 +528,7 @@ extension AppStateOfflineExtension on AppState {
         await makeArtistAvailableOffline(
           artist,
           requiresWifi: _autoDownloadFavoritesWifiOnly,
+          userInitiated: false,
         );
       }
     }
@@ -410,6 +538,7 @@ extension AppStateOfflineExtension on AppState {
         await makeTrackAvailableOffline(
           track,
           requiresWifi: _autoDownloadFavoritesWifiOnly,
+          userInitiated: false,
         );
       }
     }
@@ -425,10 +554,17 @@ extension AppStateOfflineExtension on AppState {
 
   void _addDownloadTask(DownloadTask task) {
     _downloadQueue.add(task);
+    _scheduleDownloadSave();
     _downloadStatusByKey[_audioKey(task.track.streamUrl)] = task.status;
   }
 
   void _replaceDownloadTaskAt(int index, DownloadTask task) {
+    if (_downloadQueue[index].status != task.status &&
+        (task.status == DownloadStatus.failed ||
+            task.status == DownloadStatus.stopped ||
+            task.status == DownloadStatus.waitingToRetry)) {
+      _scheduleDownloadSave();
+    }
     _downloadQueue[index] = task;
     _downloadStatusByKey[_audioKey(task.track.streamUrl)] = task.status;
   }
@@ -441,6 +577,7 @@ extension AppStateOfflineExtension on AppState {
   Future<void> _queueDownload(
     MediaItem track, {
     bool requiresWifi = false,
+    bool userInitiated = true,
   }) async {
     final generation = _captureServerGeneration();
     final normalized = _normalizeTrackForPlayback(track);
@@ -448,8 +585,10 @@ extension AppStateOfflineExtension on AppState {
     final existingIndex = _indexOfDownload(normalized.streamUrl);
     if (existingIndex != null) {
       final existing = _downloadQueue[existingIndex];
-      if (existing.status == DownloadStatus.failed) {
-        retryDownload(existing);
+      if (userInitiated &&
+          (existing.status == DownloadStatus.failed ||
+              existing.status == DownloadStatus.stopped)) {
+        await retryDownload(existing);
       }
       return;
     }
@@ -471,10 +610,9 @@ extension AppStateOfflineExtension on AppState {
         status: DownloadStatus.queued,
         queuedAt: DateTime.now(),
         requiresWifi: requiresWifi,
+        userInitiated: userInitiated,
       ),
     );
-    _notify();
-    unawaited(_processDownloadQueue());
   }
 
   Future<void> _resumePinnedDownloads() async {
@@ -509,15 +647,13 @@ extension AppStateOfflineExtension on AppState {
           track: normalized,
           status: DownloadStatus.queued,
           queuedAt: DateTime.now(),
-          requiresWifi: _autoDownloadFavoritesWifiOnly,
+          requiresWifi: false,
+          userInitiated: false,
         ),
       );
       queuedAny = true;
     }
-    if (!queuedAny) {
-      return;
-    }
-    _notify();
+    if (queuedAny) _notify();
     if (!_downloadsPaused) {
       unawaited(_processDownloadQueue());
     }
@@ -547,6 +683,7 @@ extension AppStateOfflineExtension on AppState {
     int? totalBytes,
     int? downloadedBytes,
     String? errorMessage,
+    bool? retryableFailure,
   }) {
     final index = _indexOfDownload(streamUrl);
     if (index == null) {
@@ -567,6 +704,7 @@ extension AppStateOfflineExtension on AppState {
       totalBytes: totalBytes,
       downloadedBytes: downloadedBytes,
       errorMessage: errorMessage,
+      retryableFailure: retryableFailure,
     );
     _replaceDownloadTaskAt(index, nextTask);
     _notify();
@@ -608,25 +746,40 @@ extension AppStateOfflineExtension on AppState {
   }
 
   Future<void> _processDownloadQueue() async {
-    if (_isProcessingDownloads || _downloadsPaused) {
+    if (_isProcessingDownloads || _downloadsPaused || _offlineMode) {
       return;
     }
     final serverGeneration = _captureServerGeneration();
     _isProcessingDownloads = true;
     try {
+      await _cacheStore.saveDownloadQueue(List.of(_downloadQueue));
+      if (!_isCurrentServerGeneration(serverGeneration)) return;
       _resetWaitingDownloads();
       while (true) {
-        if (_downloadsPaused || !_isCurrentServerGeneration(serverGeneration)) {
+        if (_downloadsPaused ||
+            _offlineMode ||
+            !_isCurrentServerGeneration(serverGeneration)) {
           break;
         }
         DownloadTask? next;
         for (final task in List<DownloadTask>.from(_downloadQueue)) {
-          if (task.status != DownloadStatus.queued) {
+          final key = _audioKey(task.track.streamUrl);
+          if (_activeDownloads.contains(key) ||
+              _cancelledOfflineRequests.contains(key)) {
             continue;
           }
-          final canDownload = await _canDownloadOverNetwork(
-            requireWifi: task.requiresWifi,
-          );
+          if (task.status == DownloadStatus.waitingToRetry &&
+              (task.retryAt == null ||
+                  !task.retryAt!.isAfter(DateTime.now()))) {
+            _replaceDownloadTaskAt(_indexOfDownload(task.track.streamUrl)!,
+                task.copyWith(status: DownloadStatus.queued));
+          } else if (task.status != DownloadStatus.queued) {
+            continue;
+          }
+          final canDownload = _cacheStore.backgroundDownloads != null ||
+              await _canDownloadOverNetwork(
+                requireWifi: task.requiresWifi,
+              );
           if (!_isCurrentServerGeneration(serverGeneration)) {
             break;
           }
@@ -642,18 +795,28 @@ extension AppStateOfflineExtension on AppState {
         if (next == null) {
           break;
         }
-        await _downloadTrack(next, serverGeneration);
+        _activeDownloads.add(_audioKey(next.track.streamUrl));
+        if (_cacheStore.backgroundDownloads != null) {
+          unawaited(_downloadTrack(next, serverGeneration));
+        } else {
+          await _downloadTrack(next, serverGeneration);
+        }
       }
     } finally {
       if (_isCurrentServerGeneration(serverGeneration)) {
         _isProcessingDownloads = false;
+        _scheduleRetryWakeup();
       }
     }
   }
 
   Future<void> _downloadTrack(
       DownloadTask task, _ServerGeneration serverGeneration) async {
-    if (!_isCurrentServerGeneration(serverGeneration)) {
+    if (!_isCurrentServerGeneration(serverGeneration)) return;
+    if (_downloadsPaused ||
+        _offlineMode ||
+        _isOfflineRequestCancelled(task.track.streamUrl)) {
+      _activeDownloads.remove(_audioKey(task.track.streamUrl));
       return;
     }
     final streamUrl = task.track.streamUrl;
@@ -662,6 +825,11 @@ extension AppStateOfflineExtension on AppState {
       await for (final response in _cacheStore.downloadAudioWithProgress(
         task.track,
         headers: _playbackHeaders(),
+        requiresWifi: _downloadsWifiOnly || task.requiresWifi,
+        userInitiated: task.userInitiated &&
+            SchedulerBinding.instance.lifecycleState ==
+                AppLifecycleState.resumed,
+        requirePin: true,
       )) {
         if (!_isCurrentServerGeneration(serverGeneration)) {
           return;
@@ -671,7 +839,17 @@ extension AppStateOfflineExtension on AppState {
           _removeDownload(streamUrl);
           return;
         }
-        if (response is DownloadProgress) {
+        if (response is AudioDownloadState) {
+          final canDownload =
+              await _canDownloadOverNetwork(requireWifi: task.requiresWifi);
+          if (!_isCurrentServerGeneration(serverGeneration)) return;
+          _updateDownloadTask(streamUrl,
+              status: response.running
+                  ? DownloadStatus.downloading
+                  : canDownload
+                      ? DownloadStatus.queued
+                      : DownloadStatus.waitingForWifi);
+        } else if (response is DownloadProgress) {
           _updateDownloadTask(
             streamUrl,
             progress: response.progress,
@@ -679,25 +857,76 @@ extension AppStateOfflineExtension on AppState {
             downloadedBytes: response.downloaded,
           );
         } else if (response is FileInfo) {
-          _cachedAudio.add(_audioKey(streamUrl));
+          final key = _audioKey(streamUrl);
+          final added = _cachedAudio.add(key);
+          if (added && response is CachedAudioFile) {
+            _mediaCacheBytesNotifier.value += response.bytes;
+            if (_pinnedAudio.contains(key)) {
+              _pinnedCacheBytesNotifier.value += response.bytes;
+            }
+          }
           _removeDownload(streamUrl);
-          unawaited(refreshMediaCacheBytes());
+          _scheduleCacheRefresh();
         }
       }
     } catch (error) {
       if (!_isCurrentServerGeneration(serverGeneration)) {
         return;
       }
-      if (_isOfflineRequestCancelled(streamUrl)) {
+      if (error is CacheDownloadCancelled ||
+          _isOfflineRequestCancelled(streamUrl)) {
         _clearCancelledOfflineRequest(streamUrl);
-        _removeDownload(streamUrl);
+        if (_pinnedAudio.contains(_audioKey(streamUrl)) &&
+            !_isOfflineRequestCancelled(streamUrl)) {
+          _updateDownloadTask(streamUrl, status: DownloadStatus.queued);
+        } else {
+          _removeDownload(streamUrl);
+        }
+        return;
+      }
+      if (error is AudioDownloadStopped) {
+        _updateDownloadTask(streamUrl,
+            status: DownloadStatus.stopped,
+            errorMessage: 'Download stopped. Tap retry to continue.');
+        return;
+      }
+      final retryable = error is SocketException ||
+          error is TimeoutException ||
+          (error is AudioDownloadFailure && error.retryable);
+      final attempts = task.attempts + 1;
+      if (retryable && attempts <= 5) {
+        final delay = error is AudioDownloadFailure && error.retryAfter != null
+            ? error.retryAfter!
+            : Duration(seconds: (1 << attempts) + Random().nextInt(3));
+        final index = _indexOfDownload(streamUrl);
+        if (index != null) {
+          _replaceDownloadTaskAt(
+              index,
+              task.copyWith(
+                  status: DownloadStatus.waitingToRetry,
+                  attempts: attempts,
+                  retryAt: DateTime.now().add(delay),
+                  errorMessage: 'Connection interrupted. Retrying shortly.'));
+          _notify();
+        }
         return;
       }
       _updateDownloadTask(
         streamUrl,
         status: DownloadStatus.failed,
-        errorMessage: error.toString(),
+        retryableFailure: retryable,
+        errorMessage: retryable
+            ? 'Connection interrupted. Tap retry or wait for reconnection.'
+            : error is AudioDownloadFailure
+                ? error.message
+                : 'Download failed. Tap retry to continue.',
       );
+    } finally {
+      if (_isCurrentServerGeneration(serverGeneration)) {
+        _activeDownloads.remove(_audioKey(streamUrl));
+        _scheduleRetryWakeup();
+        if (_downloadQueue.isEmpty) _scheduleDownloadSave();
+      }
     }
   }
 
@@ -705,11 +934,13 @@ extension AppStateOfflineExtension on AppState {
   Future<void> makeTrackAvailableOffline(
     MediaItem track, {
     bool requiresWifi = false,
+    bool userInitiated = true,
   }) async {
     await _setTracksAvailableOffline(
       [track],
       pinned: true,
       requiresWifi: requiresWifi,
+      userInitiated: userInitiated,
     );
   }
 
@@ -722,6 +953,7 @@ extension AppStateOfflineExtension on AppState {
   Future<void> makePlaylistAvailableOffline(
     Playlist playlist, {
     bool requiresWifi = false,
+    bool userInitiated = true,
   }) async {
     final generation = _captureServerGeneration();
     final tracks = await _loadPlaylistTracksForOffline(playlist);
@@ -730,6 +962,7 @@ extension AppStateOfflineExtension on AppState {
       tracks,
       pinned: true,
       requiresWifi: requiresWifi,
+      userInitiated: userInitiated,
     );
   }
 
@@ -745,6 +978,7 @@ extension AppStateOfflineExtension on AppState {
   Future<void> makeAlbumAvailableOffline(
     Album album, {
     bool requiresWifi = false,
+    bool userInitiated = true,
   }) async {
     final generation = _captureServerGeneration();
     final tracks = await _loadAlbumTracksForOffline(album);
@@ -753,6 +987,7 @@ extension AppStateOfflineExtension on AppState {
       tracks,
       pinned: true,
       requiresWifi: requiresWifi,
+      userInitiated: userInitiated,
     );
   }
 
@@ -768,6 +1003,7 @@ extension AppStateOfflineExtension on AppState {
   Future<void> makeArtistAvailableOffline(
     Artist artist, {
     bool requiresWifi = false,
+    bool userInitiated = true,
   }) async {
     final generation = _captureServerGeneration();
     final tracks = await _loadArtistTracksForOffline(artist);
@@ -776,6 +1012,7 @@ extension AppStateOfflineExtension on AppState {
       tracks,
       pinned: true,
       requiresWifi: requiresWifi,
+      userInitiated: userInitiated,
     );
   }
 
@@ -791,37 +1028,39 @@ extension AppStateOfflineExtension on AppState {
     List<MediaItem> tracks, {
     required bool pinned,
     bool requiresWifi = false,
+    bool userInitiated = true,
   }) async {
-    // Stop as soon as the active server changes: a later iteration would
-    // normalize against the new session and write into the wrong scope.
     final generation = _captureServerGeneration();
-    for (final track in tracks) {
+    final normalized = _deduplicateTracksForOffline(tracks);
+    if (!pinned) {
+      _cancelledOfflineRequests
+          .addAll(normalized.map((track) => _audioKey(track.streamUrl)));
+    }
+    if (pinned && userInitiated) {
+      await _cacheStore.backgroundDownloads?.requestNotifications();
       if (!_isCurrentServerGeneration(generation)) return;
-      final normalized = _normalizeTrackForPlayback(track);
-      final key = _audioKey(normalized.streamUrl);
+    }
+    await _cacheStore.updateOfflineSelection(normalized, pinned: pinned);
+    if (!_isCurrentServerGeneration(generation)) return;
+    for (final track in normalized) {
+      final key = _audioKey(track.streamUrl);
       if (pinned) {
         _cancelledOfflineRequests.remove(key);
-        await _cacheStore.setPinnedAudioItem(normalized, true);
-        if (!_isCurrentServerGeneration(generation)) return;
-        await _cacheStore.setWholeLibraryPinnedAudio(
-            normalized.streamUrl, false);
-        if (!_isCurrentServerGeneration(generation)) return;
         _pinnedAudio.add(key);
-        await _queueDownload(normalized, requiresWifi: requiresWifi);
+        await _queueDownload(track,
+            requiresWifi: requiresWifi, userInitiated: userInitiated);
+        if (!_isCurrentServerGeneration(generation)) return;
       } else {
         _cancelledOfflineRequests.add(key);
-        await _cacheStore.setPinnedAudio(normalized.streamUrl, false);
-        if (!_isCurrentServerGeneration(generation)) return;
-        await _cacheStore.setWholeLibraryPinnedAudio(
-            normalized.streamUrl, false);
-        if (!_isCurrentServerGeneration(generation)) return;
         _pinnedAudio.remove(key);
-        _removeDownload(normalized.streamUrl);
+        _removeDownload(track.streamUrl);
       }
     }
+    _scheduleDownloadSave();
     _refreshSelectedSmartList();
     unawaited(refreshMediaCacheBytes());
     _notify();
+    unawaited(_processDownloadQueue());
   }
 
   Future<List<MediaItem>> _loadAlbumTracksForOffline(Album album) {
@@ -904,7 +1143,7 @@ extension AppStateOfflineExtension on AppState {
       album.id,
     );
     if (tracks.isNotEmpty) {
-      return tracks.any(isTrackPinnedInMemory);
+      return tracks.any(isTrackAvailableOffline);
     }
     final cachedEntries = await _cacheStore.loadCachedAudioEntries();
     return cachedEntries.any(
@@ -921,7 +1160,7 @@ extension AppStateOfflineExtension on AppState {
     }
     final tracks = await _cacheStore.loadArtistTracks(artist.id);
     if (tracks.isNotEmpty) {
-      return tracks.any(isTrackPinnedInMemory);
+      return tracks.any(isTrackAvailableOffline);
     }
     final cachedEntries = await _cacheStore.loadCachedAudioEntries();
     return cachedEntries.any(
@@ -983,7 +1222,7 @@ extension AppStateOfflineExtension on AppState {
     final offline = <Playlist>[];
     for (final playlist in playlists) {
       final tracks = await _cacheStore.loadPlaylistTracks(playlist.id);
-      if (tracks.any(isTrackPinnedInMemory)) {
+      if (tracks.any(isTrackAvailableOffline)) {
         offline.add(playlist);
       }
     }

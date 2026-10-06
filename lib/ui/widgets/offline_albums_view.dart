@@ -16,7 +16,8 @@ class OfflineAlbumsView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = context.watch<AppState>();
+    context.select<AppState, int>((state) => state.offlineRevision);
+    final state = context.read<AppState>();
     return OfflineBrowseView<Album>(
       view: LibraryView.offlineAlbums,
       future: state.loadOfflineAlbums(),

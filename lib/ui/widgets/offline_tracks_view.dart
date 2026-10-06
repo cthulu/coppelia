@@ -14,7 +14,8 @@ class OfflineTracksView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final state = context.watch<AppState>();
+    context.select<AppState, int>((state) => state.offlineRevision);
+    final state = context.read<AppState>();
     return OfflineSectionLoader<MediaItem>(
       future: state.loadOfflineTracks(),
       emptyTitle: LibraryView.offlineTracks.title,

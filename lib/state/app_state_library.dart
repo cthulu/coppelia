@@ -1213,8 +1213,8 @@ extension AppStateLibraryExtension on AppState {
         return _compareBool(isFavoriteTrack(a.id), isFavoriteTrack(b.id));
       case SmartListField.isDownloaded:
         return _compareBool(
-          _isTrackOfflineReadyInMemory(a),
-          _isTrackOfflineReadyInMemory(b),
+          isTrackAvailableOffline(a),
+          isTrackAvailableOffline(b),
         );
       case SmartListField.albumIsFavorite:
         return _compareBool(
@@ -1328,7 +1328,7 @@ extension AppStateLibraryExtension on AppState {
       case SmartListField.isFavorite:
         return isFavoriteTrack(track.id);
       case SmartListField.isDownloaded:
-        return _isTrackOfflineReadyInMemory(track);
+        return isTrackAvailableOffline(track);
       case SmartListField.albumIsFavorite:
         return track.albumId != null && isFavoriteAlbum(track.albumId!);
       case SmartListField.artistIsFavorite:

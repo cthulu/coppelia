@@ -12,7 +12,10 @@ import 'package:coppelia/services/playback_controller.dart';
 
 class _Player extends Mock implements AudioPlayer {}
 
-class _Cache extends Mock implements CacheStore {}
+class _Cache extends Mock implements CacheStore {
+  @override
+  bool localPlaybackOnly = false;
+}
 
 class _DesktopPlayer extends Mock implements media_kit.Player {}
 
@@ -116,4 +119,36 @@ void main() {
         opened.last.medias.single.httpHeaders!['Authorization'], 'new-token');
     expect(playback.currentMediaItem?.id, track.id);
   });
+  for (final native in [true, false]) {
+    test(
+        'offline playback never builds a network source when a local file is gone ($native)',
+        () async {
+      final cache = _Cache()..localPlaybackOnly = true;
+      when(() => cache.getCachedAudio(any(), touch: false))
+          .thenAnswer((_) async => null);
+      final nativePlayer = _Player();
+      final desktopPlayer = _DesktopPlayer();
+      final streams = _DesktopStreams();
+      when(() => desktopPlayer.state).thenReturn(const media_kit.PlayerState());
+      when(() => desktopPlayer.stream).thenReturn(streams);
+      when(() => streams.position).thenAnswer((_) => const Stream.empty());
+      when(() => streams.duration).thenAnswer((_) => const Stream.empty());
+      when(() => streams.playing).thenAnswer((_) => const Stream.empty());
+      when(() => streams.buffering).thenAnswer((_) => const Stream.empty());
+      when(() => streams.completed).thenAnswer((_) => const Stream.empty());
+      when(() => streams.playlist).thenAnswer((_) => const Stream.empty());
+      when(() => streams.error).thenAnswer((_) => const Stream.empty());
+
+      final playback = PlaybackController(
+          audioPlayer: nativePlayer,
+          mediaKitPlayer: desktopPlayer,
+          useNativeJustAudio: native);
+      await expectLater(
+          playback.setQueue([track], cacheStore: cache), throwsStateError);
+      verifyNever(() => nativePlayer.setAudioSources(any(),
+          initialIndex: any(named: 'initialIndex'),
+          initialPosition: any(named: 'initialPosition')));
+      verifyNever(() => desktopPlayer.open(any(), play: any(named: 'play')));
+    });
+  }
 }
