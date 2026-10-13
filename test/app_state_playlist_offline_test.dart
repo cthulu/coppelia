@@ -1067,6 +1067,49 @@ void main() {
   });
 
   group('AppState detail selection', () {
+    test('nested details restore the artist, tracks and offline filter',
+        () async {
+      final cache = _MockCacheStore();
+      final client = _MockJellyfinClient();
+      final state = buildState(
+        cacheStore: cache,
+        client: client,
+        playback: _MockPlaybackController(),
+        serverStore: _MockServerStore(),
+        settingsStore: _MockSettingsStore(),
+      );
+      addTearDown(state.dispose);
+      final artist = _artist('maiden');
+      final tracks = [_track('maiden-track')];
+      final first = _album('piece-of-mind');
+      final second = _album('powerslave');
+      when(() => cache.loadArtistTracks(any())).thenAnswer((_) async => tracks);
+      when(() => client.fetchArtistTracks(any()))
+          .thenAnswer((_) async => tracks);
+      when(() => cache.saveArtistTracks(any(), any())).thenAnswer((_) async {});
+      when(() => cache.loadAlbumTracks(any()))
+          .thenAnswer((_) async => <MediaItem>[]);
+      when(() => client.fetchAlbumTracks(any()))
+          .thenAnswer((_) async => <MediaItem>[]);
+
+      await state.selectArtist(artist, offlineOnly: true);
+      await state.selectAlbum(first);
+      await state.selectAlbum(second);
+      // Opening the same detail again must not add another Back step.
+      await state.selectAlbum(second);
+      state.goBack();
+      expect(state.selectedAlbum, same(first));
+      state.goBack();
+      expect(state.selectedArtist, same(artist));
+      expect(state.selectedAlbum, isNull);
+      expect(state.artistTracks, tracks);
+      expect(state.offlineOnlyFilter, isTrue);
+      state.goBack();
+      expect(state.selectedView, LibraryView.home);
+      expect(state.selectedArtist, isNull);
+      expect(state.canGoBack, isFalse);
+    });
+
     void testHomeDetailBackNavigation(
       String detail,
       Future<void> Function(AppState state) select,
