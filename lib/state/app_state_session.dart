@@ -68,6 +68,7 @@ extension AppStateSessionExtension on AppState {
     _homeShelfLayout = await _settingsStore.loadHomeShelfLayout();
     _homeShelfGridRows = await _settingsStore.loadHomeShelfGridRows();
     _offlineMode = await _settingsStore.loadOfflineMode();
+    _cacheStore.localPlaybackOnly = _offlineMode;
     _cacheMaxBytes = await _cacheStore.loadCacheMaxBytes();
     _homeSectionVisibility = await _settingsStore.loadHomeSectionVisibility();
     _homeSectionOrder = await _settingsStore.loadHomeSectionOrder();
@@ -80,7 +81,9 @@ extension AppStateSessionExtension on AppState {
     if (!setEquals(_pinnedAudio, storedPinnedAudio)) {
       await _cacheStore.savePinnedAudio(_pinnedAudio);
     }
-    unawaited(refreshMediaCacheBytes());
+    await _restoreDownloadQueue();
+    _bindDownloadRecovery();
+    await refreshMediaCacheBytes();
     await _loadCachedLibrary();
     await _applyPlaybackSettings();
     if (_offlineMode) {
@@ -372,7 +375,9 @@ extension AppStateSessionExtension on AppState {
     final storedPinnedAudio = await _cacheStore.loadPinnedAudio();
     if (!_isCurrentServerGeneration(generation)) return;
     _pinnedAudio = storedPinnedAudio.toSet();
-    unawaited(refreshMediaCacheBytes());
+    await _restoreDownloadQueue();
+    if (!_isCurrentServerGeneration(generation)) return;
+    await refreshMediaCacheBytes();
     await _loadCachedLibrary();
     if (!_isCurrentServerGeneration(generation)) return;
     if (_offlineMode) {
@@ -393,6 +398,11 @@ extension AppStateSessionExtension on AppState {
   }
 
   Future<void> _stopForServerSwitch(_ServerGeneration serverGeneration) async {
+    _downloadSaveTimer?.cancel();
+    await _cacheStore.saveDownloadQueue(List.of(_downloadQueue));
+    if (!_isCurrentServerGeneration(serverGeneration)) return;
+    await _cacheStore.cancelDownloads();
+    if (!_isCurrentServerGeneration(serverGeneration)) return;
     final track = _nowPlaying;
     if (track != null) {
       await _cacheStore.savePlaybackResumeState(
@@ -468,7 +478,13 @@ extension AppStateSessionExtension on AppState {
     _playRequestId += 1;
     _isApplyingQueueUpdate = false;
     _queue = [];
+    _downloadSaveTimer?.cancel();
+    _downloadRetryTimer?.cancel();
+    _cacheRefreshTimer?.cancel();
+    _cacheRefreshTimer = null;
+    _activeDownloads.clear();
     _downloadQueue.clear();
+    _offlineRevision += 1;
     _downloadStatusByKey.clear();
     _downloadProgressTimestamps.clear();
     _cancelledOfflineRequests.clear();

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math';
+import 'dart:io';
 import 'package:flutter/scheduler.dart';
 
 import 'package:cached_network_image/cached_network_image.dart';
@@ -28,6 +29,7 @@ import '../models/smart_list.dart';
 import '../models/track_status_icon_state.dart';
 import '../models/whole_library_offline.dart';
 import '../services/cache_store.dart';
+import '../services/background_audio_downloads.dart';
 import '../services/jellyfin_client.dart';
 import '../services/log_service.dart';
 import '../services/now_playing_service.dart';
@@ -114,13 +116,14 @@ class AppState extends ChangeNotifier {
   int _searchFocusRequest = 0;
   int _searchRequestId = 0;
   LoopMode _repeatMode = LoopMode.off;
+  bool _disposed = false;
 
   void _notifyListenersLater() {
-    SchedulerBinding.instance.addPostFrameCallback((_) => notifyListeners());
+    SchedulerBinding.instance.addPostFrameCallback((_) => _notify());
   }
 
   void _notify() {
-    notifyListeners();
+    if (!_disposed) notifyListeners();
   }
 
   List<Playlist> _playlists = [];
@@ -155,6 +158,16 @@ class AppState extends ChangeNotifier {
   Set<String> _pinnedAudio = {};
   Set<String> _cachedAudio = {};
   final List<DownloadTask> _downloadQueue = [];
+  final Set<String> _activeDownloads = {};
+  Timer? _downloadRetryTimer;
+  Timer? _downloadSaveTimer;
+  Timer? _cacheRefreshTimer;
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
+  AppLifecycleListener? _downloadLifecycle;
+  bool _recoveringDownloads = false;
+  int _offlineRevision = 0;
+  int get offlineRevision => _offlineRevision;
+
   final Map<String, DownloadStatus> _downloadStatusByKey = {};
   final Map<String, DateTime> _downloadProgressTimestamps = {};
   final Set<String> _cancelledOfflineRequests = {};
@@ -197,7 +210,7 @@ class AppState extends ChangeNotifier {
       (revision: _serverGeneration, session: _session);
 
   bool _isCurrentServerGeneration(_ServerGeneration generation) =>
-      generation == _captureServerGeneration();
+      !_disposed && generation == _captureServerGeneration();
 
   void _updatePlaybackProgress({
     Duration? position,
@@ -711,7 +724,7 @@ class AppState extends ChangeNotifier {
     final key = _audioKey(streamUrl);
     final status = _downloadStatusByKey[key];
     if (status != null) {
-      return status == DownloadStatus.failed
+      return status == DownloadStatus.failed || status == DownloadStatus.stopped
           ? TrackStatusIconState.none
           : TrackStatusIconState.inQueue;
     }
@@ -1097,7 +1110,7 @@ class AppState extends ChangeNotifier {
 
   /// Adds a track to the end of the queue.
   Future<void> enqueueTrack(MediaItem track) async {
-    if (_offlineMode && !isTrackPinnedInMemory(track)) {
+    if (_offlineMode && !isTrackAvailableOffline(track)) {
       return;
     }
     if (_queue.isEmpty) {
@@ -1116,7 +1129,7 @@ class AppState extends ChangeNotifier {
 
   /// Inserts a track to play next.
   Future<void> playNext(MediaItem track) async {
-    if (_offlineMode && !isTrackPinnedInMemory(track)) {
+    if (_offlineMode && !isTrackAvailableOffline(track)) {
       return;
     }
     if (_queue.isEmpty) {
@@ -1186,14 +1199,15 @@ class AppState extends ChangeNotifier {
   String _audioKey(String streamUrl) =>
       _cacheStore.audioKeyForStreamUrl(streamUrl);
 
-  /// Returns whether a track is pinned, using in-memory pin state only.
+  /// Returns whether an offline selection has a known local file.
+  bool isTrackAvailableOffline(MediaItem track) =>
+      isTrackPinnedInMemory(track) &&
+      _cachedAudio.contains(_audioKey(track.streamUrl));
+
+  String trackCacheKey(MediaItem track) => _audioKey(track.streamUrl);
+
   bool isTrackPinnedInMemory(MediaItem track) =>
       _pinnedAudio.contains(_audioKey(track.streamUrl));
-
-  bool _isTrackOfflineReadyInMemory(MediaItem track) {
-    final key = _audioKey(track.streamUrl);
-    return _pinnedAudio.contains(key) && _cachedAudio.contains(key);
-  }
 
   MediaItem _mediaItemFromCachedEntry(CachedAudioEntry entry) {
     final mediaItem = entry.mediaItem;
@@ -1224,6 +1238,15 @@ class AppState extends ChangeNotifier {
   /// Releases audio resources.
   @override
   void dispose() {
+    _disposed = true;
+    if (_downloadSaveTimer?.isActive == true) {
+      unawaited(_cacheStore.saveDownloadQueue(List.of(_downloadQueue)));
+    }
+    _downloadRetryTimer?.cancel();
+    _downloadSaveTimer?.cancel();
+    _cacheRefreshTimer?.cancel();
+    _connectivitySubscription?.cancel();
+    _downloadLifecycle?.dispose();
     _durationSubscription?.cancel();
     _playerStateSubscription?.cancel();
     _currentIndexSubscription?.cancel();
@@ -1290,11 +1313,13 @@ class AppState extends ChangeNotifier {
         index == previousIndex) {
       return;
     }
+    if (_offlineMode || _downloadsPaused) return;
     unawaited(
       _cacheStore.handlePlaybackAdvance(
         _queue,
         index,
         headers: _playbackHeaders(),
+        requiresWifi: _downloadsWifiOnly,
       ),
     );
   }
@@ -1683,7 +1708,7 @@ class AppState extends ChangeNotifier {
     if (_pinnedAudio.isEmpty) {
       return [];
     }
-    return tracks.where(isTrackPinnedInMemory).toList();
+    return tracks.where(isTrackAvailableOffline).toList();
   }
 
   Future<List<MediaItem>> _offlineTracksForAlbum(Album album) async {
@@ -1847,6 +1872,8 @@ class AppState extends ChangeNotifier {
     if (!_isCurrentServerGeneration(generation)) return;
     if (isCached) {
       _cachedAudio.add(_audioKey(track.streamUrl));
+    } else {
+      _cachedAudio.remove(_audioKey(track.streamUrl));
     }
     // Don't reassert "preparing" if the player has already reached ready —
     // the player-state listener may have just cleared it, and there's no

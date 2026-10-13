@@ -328,13 +328,16 @@ extension AppStatePreferencesExtension on AppState {
     final generation = _captureServerGeneration();
     final entries = await _cacheStore.loadCachedAudioEntries();
     if (!_isCurrentServerGeneration(generation)) return;
-    _cachedAudio = entries.map((entry) => entry.cacheKey).toSet();
+    final cached = entries.map((entry) => entry.cacheKey).toSet();
+    _cachedAudio = cached;
+    _offlineRevision += 1;
     final totalBytes = entries.fold<int>(0, (sum, entry) => sum + entry.bytes);
     _mediaCacheBytesNotifier.value = totalBytes;
     final pinnedBytes = entries
         .where((entry) => _pinnedAudio.contains(entry.cacheKey))
         .fold<int>(0, (sum, entry) => sum + entry.bytes);
     _pinnedCacheBytesNotifier.value = pinnedBytes;
+    _notify();
   }
 
   /// Returns the estimated size of pinned downloads.

@@ -6,6 +6,7 @@ import 'package:provider/provider.dart';
 
 import 'core/theme.dart';
 import 'services/cache_store.dart';
+import 'services/background_audio_downloads.dart';
 import 'services/jellyfin_client.dart';
 import 'services/menu_service.dart';
 import 'services/playback_controller.dart';
@@ -31,7 +32,8 @@ class CoppeliaApp extends StatelessWidget {
     if (appState == null) {
       return ChangeNotifierProvider<AppState>(
         create: (_) {
-          final cacheStore = CacheStore();
+          final cacheStore =
+              CacheStore(backgroundDownloads: BackgroundAudioDownloads());
           final serverStore = ServerStore();
           final playback = PlaybackController();
           final client = JellyfinClient();

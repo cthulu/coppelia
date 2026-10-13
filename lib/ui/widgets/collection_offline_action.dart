@@ -14,21 +14,25 @@ class CollectionOfflineActionState {
 
   factory CollectionOfflineActionState.forTracks({
     required List<MediaItem> tracks,
-    required bool Function(MediaItem track) isTrackPinned,
+    required bool Function(MediaItem track) isTrackAvailable,
+    required String Function(MediaItem track) trackKey,
     required List<DownloadTask> downloadQueue,
   }) {
-    final urls = tracks.map((track) => track.streamUrl).toSet();
+    final keys = tracks.map(trackKey).toSet();
     final downloads = downloadQueue
-        .where((task) => urls.contains(task.track.streamUrl))
+        .where((task) => keys.contains(trackKey(task.track)))
         .toList();
     return CollectionOfflineActionState(
       canDownload: tracks.isNotEmpty,
-      isOfflineReady:
-          tracks.isNotEmpty && tracks.every(isTrackPinned) && downloads.isEmpty,
-      isOfflinePending:
-          downloads.any((task) => task.status != DownloadStatus.failed),
-      hasFailedDownloads:
-          downloads.any((task) => task.status == DownloadStatus.failed),
+      isOfflineReady: tracks.isNotEmpty &&
+          tracks.every(isTrackAvailable) &&
+          downloads.isEmpty,
+      isOfflinePending: downloads.any((task) =>
+          task.status != DownloadStatus.failed &&
+          task.status != DownloadStatus.stopped),
+      hasFailedDownloads: downloads.any((task) =>
+          task.status == DownloadStatus.failed ||
+          task.status == DownloadStatus.stopped),
     );
   }
 

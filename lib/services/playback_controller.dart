@@ -408,6 +408,9 @@ class _JustAudioPlaybackEngine implements _PlaybackEngine {
       await logService.info('_buildSource: FILE "${item.title}" ${file.path}');
       return AudioSource.file(file.path, tag: tag);
     }
+    if (cacheStore?.localPlaybackOnly == true) {
+      throw StateError('This song is no longer available offline.');
+    }
     await logService
         .info('_buildSource: URI "${item.title}" ${item.streamUrl}');
     return AudioSource.uri(
@@ -855,6 +858,9 @@ class _MediaKitPlaybackEngine implements _PlaybackEngine {
     if (file != null) {
       await logService.info('_buildMedia: FILE "${item.title}" ${file.path}');
       return media_kit.Media(Uri.file(file.path).toString());
+    }
+    if (cacheStore?.localPlaybackOnly == true) {
+      throw StateError('This song is no longer available offline.');
     }
     await logService.info('_buildMedia: URI "${item.title}" ${item.streamUrl}');
     return media_kit.Media(item.streamUrl, httpHeaders: headers);

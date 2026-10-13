@@ -22,7 +22,8 @@ void main() {
     test('returns disabled make state for empty playlist', () {
       final state = CollectionOfflineActionState.forTracks(
         tracks: const [],
-        isTrackPinned: (_) => false,
+        trackKey: (track) => track.id,
+        isTrackAvailable: (_) => false,
         downloadQueue: const [],
       );
 
@@ -36,7 +37,8 @@ void main() {
       final track = _track('1');
       final state = CollectionOfflineActionState.forTracks(
         tracks: [track],
-        isTrackPinned: (candidate) => candidate.id == track.id,
+        trackKey: (track) => track.id,
+        isTrackAvailable: (_) => false,
         downloadQueue: [
           DownloadTask(
             track: track,
@@ -56,7 +58,8 @@ void main() {
       final track = _track('2');
       final state = CollectionOfflineActionState.forTracks(
         tracks: [track],
-        isTrackPinned: (_) => false,
+        trackKey: (track) => track.id,
+        isTrackAvailable: (_) => false,
         downloadQueue: [
           DownloadTask(
             track: track,
@@ -78,7 +81,8 @@ void main() {
       final second = _track('4');
       final state = CollectionOfflineActionState.forTracks(
         tracks: [first, second],
-        isTrackPinned: (_) => true,
+        trackKey: (track) => track.id,
+        isTrackAvailable: (_) => true,
         downloadQueue: const [],
       );
 
@@ -93,7 +97,8 @@ void main() {
       final unrelatedTrack = _track('other');
       final state = CollectionOfflineActionState.forTracks(
         tracks: [playlistTrack],
-        isTrackPinned: (_) => false,
+        trackKey: (track) => track.id,
+        isTrackAvailable: (_) => false,
         downloadQueue: [
           DownloadTask(
             track: unrelatedTrack,
@@ -107,5 +112,36 @@ void main() {
       expect(state.hasFailedDownloads, isFalse);
       expect(state.label, 'Make Available Offline');
     });
+  });
+  test(
+      'pins with missing files are not ready and alias URLs share one download',
+      () {
+    final track = _track('alias');
+    final alias = MediaItem(
+        id: track.id,
+        title: track.title,
+        album: track.album,
+        artists: track.artists,
+        duration: track.duration,
+        imageUrl: null,
+        streamUrl: 'https://other-address.example.com/Audio/alias/universal');
+    final state = CollectionOfflineActionState.forTracks(
+        tracks: [track],
+        isTrackAvailable: (_) => false,
+        trackKey: (item) => item.id,
+        downloadQueue: [
+          DownloadTask(
+              track: alias,
+              status: DownloadStatus.waitingToRetry,
+              queuedAt: DateTime(2026))
+        ]);
+    expect(state.isOfflineReady, isFalse);
+    expect(state.isOfflinePending, isTrue);
+    final missing = CollectionOfflineActionState.forTracks(
+        tracks: [track],
+        isTrackAvailable: (_) => false,
+        trackKey: (item) => item.id,
+        downloadQueue: []);
+    expect(missing.isOfflineReady, isFalse);
   });
 }

@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'package:file/local.dart';
+import 'package:coppelia/services/background_audio_downloads.dart';
 
 import 'package:coppelia/models/playback_resume_state.dart';
 
@@ -182,6 +184,41 @@ void main() {
     required _MockServerStore serverStore,
     required _MockSettingsStore settingsStore,
   }) {
+    final storedPins = <String>{};
+    when(() => cacheStore.updateOfflineSelection(any(),
+        pinned: any(named: 'pinned'),
+        wholeLibrary: any(named: 'wholeLibrary'))).thenAnswer((call) async {
+      final tracks = call.positionalArguments[0] as List<MediaItem>;
+      final keys = tracks
+          .map((track) => cacheStore.audioKeyForStreamUrl(track.streamUrl))
+          .toSet();
+      final whole =
+          Set<String>.of(await cacheStore.loadWholeLibraryPinnedAudio());
+      if (call.namedArguments[#pinned] == true) {
+        if (call.namedArguments[#wholeLibrary] == true) {
+          whole.addAll(keys.difference(storedPins));
+        } else {
+          whole.removeAll(keys);
+        }
+        storedPins.addAll(keys);
+      } else {
+        storedPins.removeAll(keys);
+        whole.removeAll(keys);
+      }
+      await cacheStore.saveWholeLibraryPinnedAudio(whole);
+      return whole;
+    });
+    when(() => cacheStore.removeWholeLibrarySelection()).thenAnswer((_) async {
+      final whole =
+          Set<String>.of(await cacheStore.loadWholeLibraryPinnedAudio());
+      storedPins.removeAll(whole);
+      await cacheStore.saveWholeLibraryPinnedAudio({});
+      return whole;
+    });
+    when(() => cacheStore.loadDownloadQueue()).thenAnswer((_) async => []);
+    when(() => cacheStore.saveDownloadQueue(any())).thenAnswer((_) async {});
+    when(() => cacheStore.cancelDownloads(streamUrl: any(named: 'streamUrl')))
+        .thenAnswer((_) async {});
     when(
       () => playback.positionStream,
     ).thenAnswer((_) => const Stream<Duration>.empty());
@@ -289,6 +326,9 @@ void main() {
       () => cacheStore.downloadAudioWithProgress(
         any(),
         headers: any(named: 'headers'),
+        requiresWifi: any(named: 'requiresWifi'),
+        userInitiated: any(named: 'userInitiated'),
+        requirePin: any(named: 'requirePin'),
       ),
     ).thenAnswer((_) => const Stream<FileResponse>.empty());
     when(() => settingsStore.saveDownloadsPaused(any()))
@@ -750,7 +790,6 @@ void main() {
       expect(state.downloadQueue, isEmpty);
       verifyNever(() => client.fetchPlaylistTracks(any()));
       for (final track in tracks) {
-        verify(() => cacheStore.setPinnedAudioItem(track, true)).called(1);
         verify(() => cacheStore.isAudioCached(track)).called(1);
         verify(() => cacheStore.touchCachedAudio(track)).called(1);
       }
@@ -792,7 +831,8 @@ void main() {
       verify(() => client.fetchPlaylistTracks(playlist.id)).called(1);
       verify(() => cacheStore.savePlaylistTracks(playlist.id, tracks))
           .called(1);
-      verify(() => cacheStore.setPinnedAudioItem(tracks.first, true)).called(1);
+      verify(() => cacheStore.updateOfflineSelection(tracks, pinned: true))
+          .called(1);
       expect(state.pinnedAudio, contains(tracks.first.streamUrl));
     });
 
@@ -829,10 +869,8 @@ void main() {
       await state.unpinPlaylistOffline(playlist);
 
       expect(state.pinnedAudio, isEmpty);
-      for (final track in tracks) {
-        verify(() => cacheStore.setPinnedAudio(track.streamUrl, false))
-            .called(1);
-      }
+      verify(() => cacheStore.updateOfflineSelection(tracks, pinned: false))
+          .called(1);
     });
   });
 
@@ -1511,6 +1549,9 @@ void main() {
         () => cacheStore.downloadAudioWithProgress(
           track,
           headers: any(named: 'headers'),
+          requiresWifi: any(named: 'requiresWifi'),
+          userInitiated: any(named: 'userInitiated'),
+          requirePin: any(named: 'requirePin'),
         ),
       ).thenAnswer(
           (_) => Stream<FileResponse>.error(Exception('download failed')));
@@ -1628,7 +1669,10 @@ void main() {
     await pin;
     final requests = <({String url, Map<String, String>? headers})>[];
     when(() => h.cache.downloadAudioWithProgress(any(),
-        headers: any(named: 'headers'))).thenAnswer((call) {
+        headers: any(named: 'headers'),
+        requiresWifi: any(named: 'requiresWifi'),
+        userInitiated: any(named: 'userInitiated'),
+        requirePin: any(named: 'requirePin'))).thenAnswer((call) {
       requests.add((
         url: (call.positionalArguments.single as MediaItem).streamUrl,
         headers: call.namedArguments[#headers] as Map<String, String>?
@@ -1877,6 +1921,59 @@ void main() {
     expect(h.state.libraryTracks, isEmpty);
     verifyNever(() => h.cache.saveLibraryTracks(any()));
   });
+
+  test('entering offline mode cannot replace a newer playback selection',
+      () async {
+    final cache = _MockCacheStore();
+    final playback = _MockPlaybackController();
+    final settings = _MockSettingsStore();
+    final state = buildState(
+        cacheStore: cache,
+        client: _MockJellyfinClient(),
+        playback: playback,
+        serverStore: _MockServerStore(),
+        settingsStore: settings);
+    addTearDown(state.dispose);
+    when(() => settings.saveOfflineMode(any())).thenAnswer((_) async {});
+    when(() => playback.processingState).thenReturn(ProcessingState.idle);
+    when(() => cache.savePlayHistory(any())).thenAnswer((_) async {});
+    when(() => cache.savePlaybackResumeState(any())).thenAnswer((_) async {});
+    when(() => playback.setQueue(any(),
+        startIndex: any(named: 'startIndex'),
+        startPosition: any(named: 'startPosition'),
+        cacheStore: any(named: 'cacheStore'),
+        headers: any(named: 'headers'))).thenAnswer((_) async {});
+    when(() => playback.play()).thenAnswer((_) async {});
+    final oldTrack = _track('old-selection');
+    final newTrack = _track('new-selection');
+    when(() => cache.loadPinnedAudio())
+        .thenAnswer((_) async => {newTrack.streamUrl});
+    when(() => cache.loadCachedAudioEntries()).thenAnswer((_) async => [
+          CachedAudioEntry(
+              cacheKey: newTrack.streamUrl,
+              title: newTrack.title,
+              album: newTrack.album,
+              artists: newTrack.artists,
+              cachedAt: DateTime(2026),
+              bytes: 1,
+              mediaItem: newTrack),
+        ]);
+    await state.makeTrackAvailableOffline(newTrack);
+    await state.playFromList([oldTrack], oldTrack);
+    final clearing = Completer<void>();
+    final cleared = Completer<void>();
+    when(() => playback.clearQueue(keepCurrent: false)).thenAnswer((_) {
+      clearing.complete();
+      return cleared.future;
+    });
+    final transition = state.setOfflineMode(true);
+    await clearing.future;
+    await state.playFromList([newTrack], newTrack);
+    cleared.complete();
+    await transition;
+    expect(state.queue.single.id, newTrack.id);
+    expect(state.nowPlaying?.id, newTrack.id);
+  });
   test(
       'resuming pins cannot enqueue a track after its cache lookup crosses a switch',
       () async {
@@ -1966,5 +2063,191 @@ void main() {
     saved.complete();
     await pending;
     verifyNever(() => h.client.deletePlaylist(any()));
+  });
+  test('whole-library removal cannot change the new profile after a switch',
+      () async {
+    final h = await buildServerRaceState();
+    final release = Completer<Set<String>>();
+    when(() => h.cache.removeWholeLibrarySelection())
+        .thenAnswer((_) => release.future);
+    final pending = h.state.removeWholeLibraryOfflineSelection();
+    await h.state.switchServer('server-2', addressId: 'address-2');
+    final pins = h.state.pinnedAudio.toSet();
+    release.complete({'server-1:audio:old'});
+    expect((await pending).removedTrackCount, 0);
+    expect(h.state.pinnedAudio, pins);
+  });
+
+  test(
+      'cache cancellation keeps pinned intent queued instead of leaving it active',
+      () async {
+    final h = await buildServerRaceState();
+    when(() => h.cache.isAudioCached(any())).thenAnswer((_) async => false);
+    final stream = StreamController<FileResponse>();
+    when(() => h.cache.downloadAudioWithProgress(any(),
+        headers: any(named: 'headers'),
+        requiresWifi: any(named: 'requiresWifi'),
+        userInitiated: any(named: 'userInitiated'),
+        requirePin: any(named: 'requirePin'))).thenAnswer((_) => stream.stream);
+    await h.state.makeTrackAvailableOffline(_track('cleared'));
+    await Future<void>.delayed(Duration.zero);
+    expect(h.state.downloadQueue.single.status, DownloadStatus.downloading);
+    await h.state.setDownloadsPaused(true);
+    stream.addError(const CacheDownloadCancelled());
+    await stream.close();
+    await Future<void>.delayed(Duration.zero);
+    expect(h.state.downloadQueue.single.status, DownloadStatus.queued);
+  });
+  test(
+      'temporary failures back off without blocking other songs, then retry automatically',
+      () async {
+    final h = await buildServerRaceState();
+    when(() => h.cache.isAudioCached(any())).thenAnswer((_) async => false);
+    final attempted = <String>[];
+    when(() => h.cache.downloadAudioWithProgress(any(),
+        headers: any(named: 'headers'),
+        requiresWifi: any(named: 'requiresWifi'),
+        userInitiated: any(named: 'userInitiated'),
+        requirePin: any(named: 'requirePin'))).thenAnswer((call) async* {
+      final track = call.positionalArguments.first as MediaItem;
+      attempted.add(track.id);
+      if (track.id == 'retry' &&
+          attempted.where((id) => id == 'retry').length == 1) {
+        throw const AudioDownloadFailure('temporary',
+            retryable: true, retryAfter: Duration(milliseconds: 30));
+      }
+      yield FileInfo(const LocalFileSystem().file('/tmp/completed'),
+          FileSource.Online, DateTime(2100), track.streamUrl);
+    });
+    await h.state
+        .makeWholeLibraryAvailableOffline([_track('retry'), _track('other')]);
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+    expect(attempted, ['retry', 'other', 'retry']);
+    expect(h.state.downloadQueue, isEmpty);
+  });
+
+  test('authentication failures remain actionable instead of auto-retrying',
+      () async {
+    final h = await buildServerRaceState();
+    when(() => h.cache.isAudioCached(any())).thenAnswer((_) async => false);
+    var attempts = 0;
+    when(() => h.cache.downloadAudioWithProgress(any(),
+        headers: any(named: 'headers'),
+        requiresWifi: any(named: 'requiresWifi'),
+        userInitiated: any(named: 'userInitiated'),
+        requirePin: any(named: 'requirePin'))).thenAnswer((_) async* {
+      attempts++;
+      throw const AudioDownloadFailure('Sign in again to download this song.');
+    });
+    await h.state.makeTrackAvailableOffline(_track('unauthorized'));
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    expect(attempts, 1);
+    expect(h.state.downloadQueue.single.status, DownloadStatus.failed);
+    expect(
+        h.state.downloadQueue.single.errorMessage, contains('Sign in again'));
+  });
+
+  test('restored pending downloads start even when no new pins are discovered',
+      () async {
+    final h = await buildServerRaceState();
+    final track = _track('restored');
+    final session = h.state.session!;
+    final key =
+        h.runtime.buildStreamUrl(itemId: track.id, userId: session.userId);
+    when(() => h.servers.activate('server-1', addressId: 'address-1'))
+        .thenAnswer((_) async =>
+            StoredServerSession(server: _savedServer, session: session));
+    when(() => h.cache.loadPinnedAudio()).thenAnswer((_) async => {key});
+    when(() => h.cache.loadPinnedAudioItems()).thenAnswer((_) async => [track]);
+    when(() => h.cache.isAudioCached(any())).thenAnswer((_) async => false);
+    when(() => h.cache.loadDownloadQueue()).thenAnswer((_) async => [
+          DownloadTask(
+              track: track,
+              status: DownloadStatus.queued,
+              queuedAt: DateTime(2026)),
+        ]);
+    await h.state.switchServer('server-1', addressId: 'address-1');
+    await Future<void>.delayed(Duration.zero);
+    verify(() => h.cache.downloadAudioWithProgress(any(),
+        headers: any(named: 'headers'),
+        requiresWifi: any(named: 'requiresWifi'),
+        userInitiated: any(named: 'userInitiated'),
+        requirePin: true)).called(1);
+  });
+
+  test('automatic favorites refresh does not retry a stopped download',
+      () async {
+    final h = await buildServerRaceState();
+    when(() => h.cache.isAudioCached(any())).thenAnswer((_) async => false);
+    var attempts = 0;
+    when(() => h.cache.downloadAudioWithProgress(any(),
+        headers: any(named: 'headers'),
+        requiresWifi: any(named: 'requiresWifi'),
+        userInitiated: any(named: 'userInitiated'),
+        requirePin: any(named: 'requirePin'))).thenAnswer((_) async* {
+      attempts++;
+      throw const AudioDownloadStopped();
+    });
+    final track = _track('stopped');
+    await h.state.makeTrackAvailableOffline(track, userInitiated: false);
+    await Future<void>.delayed(Duration.zero);
+    expect(h.state.downloadQueue.single.status, DownloadStatus.stopped);
+    await h.state.makeTrackAvailableOffline(track, userInitiated: false);
+    await Future<void>.delayed(Duration.zero);
+    expect(attempts, 1);
+    expect(h.state.downloadQueue.single.status, DownloadStatus.stopped);
+  });
+
+  test('retrying while paused persists the new queue intent', () async {
+    final h = await buildServerRaceState();
+    when(() => h.cache.isAudioCached(any())).thenAnswer((_) async => false);
+    when(() => h.cache.downloadAudioWithProgress(any(),
+        headers: any(named: 'headers'),
+        requiresWifi: any(named: 'requiresWifi'),
+        userInitiated: any(named: 'userInitiated'),
+        requirePin: any(named: 'requirePin'))).thenAnswer((_) async* {
+      throw const AudioDownloadStopped();
+    });
+    await h.state.makeTrackAvailableOffline(_track('retry-paused'));
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+    await h.state.setDownloadsPaused(true);
+    clearInteractions(h.cache);
+    h.state.retryDownload(h.state.downloadQueue.single);
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+    final saved =
+        verify(() => h.cache.saveDownloadQueue(captureAny())).captured;
+    expect((saved.last as List<DownloadTask>).single.status,
+        DownloadStatus.queued);
+  });
+
+  test('completed songs update counters without rescanning an active batch',
+      () async {
+    final h = await buildServerRaceState();
+    when(() => h.cache.isAudioCached(any())).thenAnswer((_) async => false);
+    final first = StreamController<FileResponse>();
+    final second = StreamController<FileResponse>();
+    when(() => h.cache.downloadAudioWithProgress(any(),
+            headers: any(named: 'headers'),
+            requiresWifi: any(named: 'requiresWifi'),
+            userInitiated: any(named: 'userInitiated'),
+            requirePin: any(named: 'requirePin')))
+        .thenAnswer((call) =>
+            (call.positionalArguments.first as MediaItem).id == 'counted'
+                ? first.stream
+                : second.stream);
+    await h.state.makeWholeLibraryAvailableOffline(
+        [_track('counted'), _track('waiting')]);
+    await Future<void>.delayed(Duration.zero);
+    clearInteractions(h.cache);
+    first.add(CachedAudioFile(
+        FileInfo(const LocalFileSystem().file('/tmp/complete'),
+            FileSource.Online, DateTime(2100), _track('counted').streamUrl),
+        42));
+    await first.close();
+    await Future<void>.delayed(const Duration(milliseconds: 600));
+    expect(h.state.mediaCacheBytesListenable.value, 42);
+    expect(h.state.pinnedCacheBytesListenable.value, 42);
+    verifyNever(() => h.cache.loadCachedAudioEntries());
+    await second.close();
   });
 }

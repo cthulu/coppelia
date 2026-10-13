@@ -54,12 +54,13 @@ class _PlaylistDetailViewState extends State<PlaylistDetailView> {
         state.session != null && !state.offlineMode && !state.offlineOnlyFilter;
     final fullPlaylistTracks = state.playlistTracks;
     final offlineTracks =
-        fullPlaylistTracks.where(state.isTrackPinnedInMemory).toList();
+        fullPlaylistTracks.where(state.isTrackAvailableOffline).toList();
     final displayTracks =
         state.offlineOnlyFilter ? offlineTracks : fullPlaylistTracks;
     final offlineState = CollectionOfflineActionState.forTracks(
       tracks: fullPlaylistTracks,
-      isTrackPinned: state.isTrackPinnedInMemory,
+      isTrackAvailable: state.isTrackAvailableOffline,
+      trackKey: state.trackCacheKey,
       downloadQueue: state.downloadQueue,
     );
     final offlineOnPressed = offlineState.canDownload

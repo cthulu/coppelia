@@ -49,10 +49,11 @@ class _ArtistDetailViewState extends State<ArtistDetailView> {
     final albums = _albumsForArtist(state.albums, artist.name);
     final hasAlbums = albums.isNotEmpty;
     final tracks = state.artistTracks;
-    final offlineTracks = tracks.where(state.isTrackPinnedInMemory).toList();
+    final offlineTracks = tracks.where(state.isTrackAvailableOffline).toList();
     final offlineState = CollectionOfflineActionState.forTracks(
       tracks: tracks,
-      isTrackPinned: state.isTrackPinnedInMemory,
+      isTrackAvailable: state.isTrackAvailableOffline,
+      trackKey: state.trackCacheKey,
       downloadQueue: state.downloadQueue,
     );
     final displayTracks = state.offlineOnlyFilter ? offlineTracks : tracks;

@@ -9,7 +9,6 @@ class WholeLibraryOfflinePreview {
     required this.cachedTrackCount,
     required this.estimatedTotalBytes,
     required this.estimatedRemainingBytes,
-    required this.cacheMaxBytes,
     required this.downloadsWifiOnly,
     required this.downloadsPaused,
     required this.wholeLibraryPinnedTrackCount,
@@ -30,9 +29,6 @@ class WholeLibraryOfflinePreview {
   /// Estimated additional bytes still left to download.
   final int estimatedRemainingBytes;
 
-  /// Current configured cache limit, or `0` for unlimited.
-  final int cacheMaxBytes;
-
   /// True when downloads are limited to Wi-Fi.
   final bool downloadsWifiOnly;
 
@@ -41,10 +37,6 @@ class WholeLibraryOfflinePreview {
 
   /// Tracks currently tracked as part of a prior whole-library action.
   final int wholeLibraryPinnedTrackCount;
-
-  /// True when the estimate is larger than the configured cache limit.
-  bool get shouldOfferUnlimitedCache =>
-      cacheMaxBytes > 0 && estimatedTotalBytes > cacheMaxBytes;
 }
 
 /// Result summary after queueing an entire library for offline playback.
