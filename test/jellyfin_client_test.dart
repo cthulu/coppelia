@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 import 'package:mocktail/mocktail.dart';
 
 import 'package:coppelia/models/auth_session.dart';
+import 'package:coppelia/models/media_item.dart';
 import 'package:coppelia/services/jellyfin_client.dart';
 
 class _MockHttpClient extends Mock implements http.Client {}
@@ -18,6 +19,155 @@ void main() {
     registerFallbackValue(
       http.Request('POST', Uri.parse('https://example.com')),
     );
+  });
+
+  test('library 401s request sign-in, but 403s do not', () async {
+    final transport = _MockHttpClient();
+    final client = JellyfinClient(httpClient: transport);
+    const session = AuthSession(
+        accessToken: 'old-token',
+        serverUrl: 'https://example.com',
+        userId: 'user',
+        userName: 'User');
+    client.updateSession(session);
+    final rejected = <AuthSession>[];
+    client.onAuthenticationRequired = rejected.add;
+    when(() => transport.get(any(), headers: any(named: 'headers')))
+        .thenAnswer((_) async => http.Response('', 401));
+    await expectLater(
+        client.fetchPlaylists(),
+        throwsA(isA<JellyfinAuthenticationException>()
+            .having((error) => error.session, 'session', same(session))));
+    expect(rejected, [session]);
+    rejected.clear();
+    when(() => transport.get(any(), headers: any(named: 'headers')))
+        .thenAnswer((_) async => http.Response('', 403));
+    await expectLater(client.fetchPlaylists(), throwsException);
+    expect(rejected, isEmpty);
+  });
+
+  test('a delayed 401 cannot reject a replacement session', () async {
+    final transport = _MockHttpClient();
+    final response = Completer<http.Response>();
+    when(() => transport.get(any(), headers: any(named: 'headers')))
+        .thenAnswer((_) => response.future);
+    final client = JellyfinClient(httpClient: transport);
+    client.updateSession(const AuthSession(
+        accessToken: 'old-token',
+        serverUrl: 'https://example.com',
+        userId: 'user',
+        userName: 'User'));
+    final rejected = <AuthSession>[];
+    client.onAuthenticationRequired = rejected.add;
+    final request = expectLater(client.fetchPlaylists(), throwsException);
+    client.updateSession(const AuthSession(
+        accessToken: 'new-token',
+        serverUrl: 'https://example.com',
+        userId: 'user',
+        userName: 'User'));
+    response.complete(http.Response('', 401));
+    await request;
+    expect(rejected, isEmpty);
+  });
+
+  test('device metadata changes cannot hide a rejected token', () async {
+    final transport = _MockHttpClient();
+    final response = Completer<http.Response>();
+    when(() => transport.get(any(), headers: any(named: 'headers')))
+        .thenAnswer((_) => response.future);
+    final client = JellyfinClient(httpClient: transport);
+    const session = AuthSession(
+        accessToken: 'token',
+        serverUrl: 'https://example.com',
+        userId: 'user',
+        userName: 'User');
+    client.updateSession(session);
+    final rejected = <AuthSession>[];
+    client.onAuthenticationRequired = rejected.add;
+    final request = expectLater(client.fetchPlaylists(),
+        throwsA(isA<JellyfinAuthenticationException>()));
+    client.updateDeviceInfo(deviceId: 'device-id', deviceName: 'New name');
+    response.complete(http.Response('', 401));
+    await request;
+    expect(rejected, [session]);
+  });
+
+  test('a telemetry 401 requests sign-in without interrupting playback',
+      () async {
+    final transport = _MockHttpClient();
+    when(() => transport.post(any(),
+            headers: any(named: 'headers'), body: any(named: 'body')))
+        .thenAnswer((_) async => http.Response('', 401));
+    final client = JellyfinClient(httpClient: transport);
+    const session = AuthSession(
+        accessToken: 'token',
+        serverUrl: 'https://example.com',
+        userId: 'user',
+        userName: 'User');
+    client.updateSession(session);
+    final rejected = <AuthSession>[];
+    client.onAuthenticationRequired = rejected.add;
+    await client.reportPlaybackStart(
+        track: const MediaItem(
+            id: 'track',
+            title: 'Track',
+            album: 'Album',
+            artists: [],
+            duration: Duration.zero,
+            imageUrl: null,
+            streamUrl: 'https://example.com/audio'),
+        position: Duration.zero,
+        isPaused: false,
+        playSessionId: 'play-session',
+        duration: Duration.zero);
+    expect(rejected, [session]);
+  });
+
+  test('a bad login does not invalidate the current saved session', () async {
+    final transport = _MockHttpClient();
+    when(() => transport.post(any(),
+            headers: any(named: 'headers'), body: any(named: 'body')))
+        .thenAnswer((_) async => http.Response('', 401));
+    final client = JellyfinClient(httpClient: transport);
+    const session = AuthSession(
+        accessToken: 'valid-token',
+        serverUrl: 'https://example.com',
+        userId: 'user',
+        userName: 'User');
+    client.updateSession(session);
+    final rejected = <AuthSession>[];
+    client.onAuthenticationRequired = rejected.add;
+    await expectLater(
+        client.authenticate(
+            serverUrl: session.serverUrl,
+            username: 'different-user',
+            password: 'wrong'),
+        throwsException);
+    expect(rejected, isEmpty);
+    expect(client.session, same(session));
+  });
+
+  test('a rejected address alias does not invalidate the current session',
+      () async {
+    final transport = _MockHttpClient();
+    when(() => transport.get(any(), headers: any(named: 'headers')))
+        .thenAnswer((_) async => http.Response('', 401));
+    final client = JellyfinClient(httpClient: transport);
+    client.updateSession(const AuthSession(
+        accessToken: 'token',
+        serverUrl: 'https://example.com',
+        userId: 'user',
+        userName: 'User'));
+    final rejected = <AuthSession>[];
+    client.onAuthenticationRequired = rejected.add;
+    await expectLater(
+        client.validateSession(const AuthSession(
+            accessToken: 'token',
+            serverUrl: 'https://example.com/wrong-path',
+            userId: 'user',
+            userName: 'User')),
+        throwsException);
+    expect(rejected, isEmpty);
   });
 
   test('authenticate builds an auth session', () async {

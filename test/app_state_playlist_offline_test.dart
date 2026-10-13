@@ -5,8 +5,13 @@ import 'package:coppelia/services/background_audio_downloads.dart';
 import 'package:coppelia/models/playback_resume_state.dart';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import 'package:coppelia/ui/widgets/server_error_banner.dart';
 import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart' as http_testing;
 import 'package:just_audio/just_audio.dart';
 import 'package:mocktail/mocktail.dart';
 
@@ -24,6 +29,7 @@ import 'package:coppelia/models/saved_server.dart';
 import 'package:coppelia/models/track_status_icon_state.dart';
 import 'package:coppelia/services/cache_store.dart';
 import 'package:coppelia/services/jellyfin_client.dart';
+import 'package:coppelia/services/log_service.dart';
 import 'package:coppelia/services/playback_controller.dart';
 import 'package:coppelia/services/server_store.dart';
 import 'package:coppelia/services/settings_store.dart';
@@ -1575,8 +1581,9 @@ void main() {
         _MockJellyfinClient client,
         _MockServerStore servers,
         JellyfinClient runtime,
+        VoidCallback dispose,
         _MockPlaybackController playback
-      })> buildServerRaceState() async {
+      })> buildServerRaceState({http.Client? httpClient}) async {
     final cache = _MockCacheStore();
     final client = _MockJellyfinClient();
     final playback = _MockPlaybackController();
@@ -1588,10 +1595,17 @@ void main() {
         playback: playback,
         serverStore: servers,
         settingsStore: settings);
-    addTearDown(state.dispose);
+    var disposed = false;
+    void dispose() {
+      if (disposed) return;
+      disposed = true;
+      state.dispose();
+    }
+
+    addTearDown(dispose);
     stubSignedInRefresh(
         cacheStore: cache, client: client, serverStore: servers);
-    final runtime = JellyfinClient();
+    final runtime = JellyfinClient(httpClient: httpClient);
     when(() => client.updateSession(any())).thenAnswer((call) {
       runtime.updateSession(call.positionalArguments.single as AuthSession);
     });
@@ -1624,6 +1638,7 @@ void main() {
       client: client,
       servers: servers,
       runtime: runtime,
+      dispose: dispose,
       playback: playback
     );
   }
@@ -2126,8 +2141,7 @@ void main() {
     expect(h.state.downloadQueue, isEmpty);
   });
 
-  test('authentication failures remain actionable instead of auto-retrying',
-      () async {
+  test('authentication failures pause the queue and request sign-in', () async {
     final h = await buildServerRaceState();
     when(() => h.cache.isAudioCached(any())).thenAnswer((_) async => false);
     var attempts = 0;
@@ -2137,14 +2151,180 @@ void main() {
         userInitiated: any(named: 'userInitiated'),
         requirePin: any(named: 'requirePin'))).thenAnswer((_) async* {
       attempts++;
-      throw const AudioDownloadFailure('Sign in again to download this song.');
+      throw const AudioDownloadFailure('Sign in again to download this song.',
+          requiresSignIn: true);
     });
     await h.state.makeTrackAvailableOffline(_track('unauthorized'));
     await Future<void>.delayed(const Duration(milliseconds: 100));
     expect(attempts, 1);
-    expect(h.state.downloadQueue.single.status, DownloadStatus.failed);
+    expect(
+        h.state.downloadQueue.single.status, DownloadStatus.waitingForSignIn);
+    expect(h.state.needsSignIn, isTrue);
     expect(
         h.state.downloadQueue.single.errorMessage, contains('Sign in again'));
+    await h.state.makeTrackAvailableOffline(_track('wait-for-login'));
+    await Future<void>.delayed(Duration.zero);
+    expect(attempts, 1);
+  });
+
+  test('an old server authentication error cannot block the new server',
+      () async {
+    final h = await buildServerRaceState();
+    final report =
+        verify(() => h.client.onAuthenticationRequired = captureAny())
+            .captured
+            .single as void Function(AuthSession);
+    final old = h.state.session!;
+    await h.state.switchServer('server-2', addressId: 'address-2');
+    report(old);
+    expect(h.state.needsSignIn, isFalse);
+    report(h.state.session!);
+    expect(h.state.needsSignIn, isTrue);
+    expect(h.state.activeServer!.id, 'server-2');
+  });
+
+  testWidgets(
+      'a library 401 offers sign-in without a callback and resumes downloads',
+      (tester) async {
+    await tester.runAsync(() async {
+      await LogService.instance;
+    });
+    tester.view.physicalSize = const Size(1280, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    final h = await buildServerRaceState(
+        httpClient:
+            http_testing.MockClient((_) async => http.Response('', 401)));
+    final old = h.state.session!;
+    final key = h.runtime.buildStreamUrl(itemId: 'blocked', userId: old.userId);
+    final pending = DownloadTask(
+        track: _track('blocked'),
+        status: DownloadStatus.waitingForSignIn,
+        queuedAt: DateTime(2026));
+    when(() => h.cache.loadDownloadQueue()).thenAnswer((_) async => [pending]);
+    when(() => h.cache.loadPinnedAudio()).thenAnswer((_) async => {key});
+    when(() => h.cache.isAudioCached(any())).thenAnswer((_) async => false);
+    when(() => h.client.authenticate(
+            serverUrl: old.serverUrl,
+            username: _savedServer.userName,
+            password: 'wrong'))
+        .thenThrow(JellyfinRequestException('Incorrect password.'));
+    const renewed = AuthSession(
+        accessToken: 'new-token',
+        serverUrl: 'https://example.com',
+        userId: 'user',
+        userName: 'User');
+    when(() => h.client.authenticate(
+        serverUrl: old.serverUrl,
+        username: _savedServer.userName,
+        password: 'correct')).thenAnswer((_) async => renewed);
+    when(() =>
+            h.servers.addAuthenticatedServer(renewed, name: any(named: 'name')))
+        .thenAnswer((_) async =>
+            const StoredServerSession(server: _savedServer, session: renewed));
+    // Exercise the real HTTP error path even without a registered callback,
+    // as can happen when an existing AppState survives hot reload.
+    when(() => h.client.fetchPlaylists())
+        .thenAnswer((_) => h.runtime.fetchPlaylists());
+    await h.state.refreshLibrary();
+    expect(h.state.needsSignIn, isTrue);
+    await tester.pumpWidget(ChangeNotifierProvider<AppState>.value(
+      value: h.state,
+      child: const MaterialApp(
+          home: Scaffold(
+              body: Column(children: [
+        ServerErrorBanner(),
+        Text('Cached library'),
+      ]))),
+    ));
+    final message = find.text('Sign in again to Example.');
+    final action = find.widgetWithText(TextButton, 'Sign in again');
+    expect(message, findsOneWidget);
+    expect(find.text('Retry'), findsNothing);
+    expect(tester.getSize(find.byType(MaterialBanner)).height,
+        lessThanOrEqualTo(56));
+    expect(
+        tester.getCenter(action).dy, closeTo(tester.getCenter(message).dy, 1));
+    tester.view.physicalSize = const Size(320, 800);
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+    expect(tester.getRect(action).right, lessThanOrEqualTo(320));
+    expect(find.text('Cached library'), findsOneWidget);
+    await tester.tap(find.text('Sign in again'));
+    await tester.pumpAndSettle();
+    expect(find.text(old.serverUrl), findsOneWidget);
+    expect(find.text(_savedServer.userName), findsOneWidget);
+    await tester.enterText(find.byType(TextField), 'wrong');
+    await tester.tap(find.widgetWithText(FilledButton, 'Sign in'));
+    await tester.pumpAndSettle();
+    expect(find.text('Incorrect password.'), findsOneWidget);
+    expect(h.state.session, same(old));
+    expect(h.state.needsSignIn, isTrue);
+    when(() => h.client.fetchPlaylists()).thenAnswer((_) async => []);
+    await tester.enterText(find.byType(TextField), 'correct');
+    await tester.tap(find.widgetWithText(FilledButton, 'Sign in'));
+    await tester.pumpAndSettle();
+    expect(find.byType(AlertDialog), findsNothing);
+    expect(find.byType(MaterialBanner), findsNothing);
+    expect(h.state.activeServer!.id, _savedServer.id);
+    expect(h.state.pinnedAudio, {key});
+    expect(h.state.session, same(renewed));
+    verify(() => h.cache.downloadAudioWithProgress(any(),
+        headers: any(named: 'headers'),
+        requiresWifi: any(named: 'requiresWifi'),
+        userInitiated: any(named: 'userInitiated'),
+        requirePin: true)).called(1);
+    verifyNever(() => h.cache.clearScope(any()));
+    await tester.pumpWidget(const SizedBox.shrink());
+    h.dispose();
+  });
+
+  testWidgets('a home refresh error stays visible until Retry succeeds',
+      (tester) async {
+    await tester.runAsync(() async {
+      await LogService.instance;
+    });
+    final h = await buildServerRaceState();
+    when(() => h.client.fetchPlaylists())
+        .thenThrow(StateError('Server unavailable'));
+    await h.state.refreshLibrary();
+    await tester.pumpWidget(ChangeNotifierProvider<AppState>.value(
+      value: h.state,
+      child: const MaterialApp(home: Scaffold(body: ServerErrorBanner())),
+    ));
+    expect(find.text('Could not refresh Example.'), findsOneWidget);
+    expect(find.byTooltip(h.state.libraryError!), findsOneWidget);
+    expect(find.text('Sign in again'), findsNothing);
+    when(() => h.client.fetchPlaylists()).thenAnswer((_) async => []);
+    await tester.tap(find.text('Retry'));
+    await tester.pumpAndSettle();
+    expect(find.byType(MaterialBanner), findsNothing);
+    await tester.pumpWidget(const SizedBox.shrink());
+    h.dispose();
+  });
+
+  test('reauthentication cannot replace the saved account with another user',
+      () async {
+    final h = await buildServerRaceState();
+    final original = h.state.session;
+    when(() => h.client.authenticate(
+            serverUrl: 'https://example.com',
+            username: _savedServer.userName,
+            password: 'password'))
+        .thenAnswer((_) async => const AuthSession(
+            accessToken: 'other-token',
+            serverUrl: 'https://example.com',
+            userId: 'other-user',
+            userName: 'User'));
+    clearInteractions(h.servers);
+    expect(
+        await h.state.reauthenticateServer(_savedServer, password: 'password'),
+        isFalse);
+    expect(h.state.session, same(original));
+    expect(h.state.authError, contains('saved account'));
+    verifyNever(() =>
+        h.servers.addAuthenticatedServer(any(), name: any(named: 'name')));
   });
 
   test('restored pending downloads start even when no new pins are discovered',

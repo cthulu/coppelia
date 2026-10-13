@@ -1922,6 +1922,9 @@ extension AppStateLibraryExtension on AppState {
       if (!_isCurrentServerGeneration(generation)) {
         return;
       }
+      if (error is JellyfinAuthenticationException) {
+        _requireSignIn(error.session);
+      }
       await LogService.instance.then(
         (log) => log.error(
           'Library: Failed to refresh $collectionName',
@@ -1929,7 +1932,9 @@ extension AppStateLibraryExtension on AppState {
           stackTrace,
         ),
       );
-      // Use cached results when available.
+      if (!_isCurrentServerGeneration(generation)) return;
+      _libraryError = 'Could not refresh $collectionName: $error';
+      // Keep cached results visible alongside the recovery action.
     } finally {
       if (_isCurrentServerGeneration(generation)) {
         _isLoadingLibrary = false;

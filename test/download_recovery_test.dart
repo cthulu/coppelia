@@ -5,6 +5,17 @@ import 'package:coppelia/models/media_item.dart';
 import 'package:coppelia/services/background_audio_downloads.dart';
 
 void main() {
+  test('sign-in recovery is offered for 401, not permission denial', () {
+    final task = bg.DownloadTask(url: 'https://example.com/audio');
+    final unauthorized = BackgroundAudioDownloads.failureFor(
+        bg.TaskStatusUpdate(task, bg.TaskStatus.failed,
+            bg.TaskHttpException('unauthorized', 401)));
+    final forbidden = BackgroundAudioDownloads.failureFor(bg.TaskStatusUpdate(
+        task, bg.TaskStatus.failed, bg.TaskHttpException('forbidden', 403)));
+    expect(unauthorized.requiresSignIn, isTrue);
+    expect(forbidden.requiresSignIn, isFalse);
+    expect(forbidden.message, contains('permissions'));
+  });
   test('only connection failures and temporary HTTP responses retry', () {
     final task = bg.DownloadTask(url: 'https://example.com/audio');
     for (final code in [401, 403, 404, 410]) {

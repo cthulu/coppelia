@@ -85,6 +85,7 @@ class AppState extends ChangeNotifier {
         _playback = playback,
         _serverStore = serverStore,
         _settingsStore = settingsStore {
+    _client.onAuthenticationRequired = _requireSignIn;
     _bindPlayback();
     _bindNowPlaying();
   }
@@ -97,6 +98,9 @@ class AppState extends ChangeNotifier {
   final SettingsStore _settingsStore;
 
   AuthSession? _session;
+  AuthSession? _rejectedSession;
+  bool get needsSignIn =>
+      _session != null && identical(_session, _rejectedSession);
   List<SavedServer> _savedServers = [];
   SavedServer? _activeServer;
   int _serverGeneration = 0;
@@ -1239,6 +1243,7 @@ class AppState extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    _client.onAuthenticationRequired = null;
     if (_downloadSaveTimer?.isActive == true) {
       unawaited(_cacheStore.saveDownloadQueue(List.of(_downloadQueue)));
     }

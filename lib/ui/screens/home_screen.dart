@@ -33,6 +33,7 @@ import '../widgets/playlist_tile.dart';
 import '../widgets/artwork_image.dart';
 import '../widgets/search_results_view.dart';
 import '../widgets/settings_view.dart';
+import '../widgets/server_error_banner.dart';
 import '../widgets/sidebar_navigation.dart';
 import '../widgets/sidebar_resize_handle.dart';
 import '../widgets/genre_detail_view.dart';
@@ -69,7 +70,10 @@ class HomeScreen extends StatelessWidget {
       },
       child: Scaffold(
         body: GradientBackground(
-          child: _MainContent(state: state),
+          child: Column(children: [
+            const ServerErrorBanner(),
+            Expanded(child: _MainContent(state: state)),
+          ]),
         ),
       ),
     );

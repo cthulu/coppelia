@@ -49,6 +49,7 @@ class JellyfinClient {
   final Duration _playlistRequestTimeout;
 
   AuthSession? _session;
+  void Function(AuthSession session)? onAuthenticationRequired;
   String _deviceId = defaultDeviceId;
   String _deviceName = defaultDeviceName;
 
@@ -63,6 +64,37 @@ class JellyfinClient {
     }
     return _authenticatedHeaders(session);
   }
+
+  Future<http.Response> _checkAuthentication(Uri uri,
+      Map<String, String>? headers, Future<http.Response> response) async {
+    final session = _session;
+    final authenticatedRequest = session != null &&
+        uri.origin == Uri.parse(session.serverUrl).origin &&
+        headers?['Authorization'] ==
+            _authenticatedHeaders(session)['Authorization'];
+    final result = await response;
+    if (result.statusCode == 401 && session != null && authenticatedRequest) {
+      if (identical(session, _session)) {
+        onAuthenticationRequired?.call(session);
+      }
+      throw JellyfinAuthenticationException(session);
+    }
+    return result;
+  }
+
+  Future<http.Response> _get(Uri uri, {Map<String, String>? headers}) =>
+      _checkAuthentication(
+          uri, headers, _httpClient.get(uri, headers: headers));
+
+  Future<http.Response> _post(Uri uri,
+          {Map<String, String>? headers, Object? body}) =>
+      _checkAuthentication(
+          uri, headers, _httpClient.post(uri, headers: headers, body: body));
+
+  Future<http.Response> _delete(Uri uri,
+          {Map<String, String>? headers, Object? body}) =>
+      _checkAuthentication(
+          uri, headers, _httpClient.delete(uri, headers: headers, body: body));
 
   /// Attaches a saved session for authenticated calls.
   void updateSession(AuthSession session) {
@@ -119,7 +151,7 @@ class JellyfinClient {
         .info('Attempting authentication to $sanitizedUrl for user $username');
 
     final uri = Uri.parse('$sanitizedUrl/Users/AuthenticateByName');
-    final response = await _httpClient.post(
+    final response = await _post(
       uri,
       headers: {
         'Content-Type': 'application/json',
@@ -129,12 +161,15 @@ class JellyfinClient {
         'Username': username,
         'Pw': password,
       }),
-    );
+    ).timeout(const Duration(seconds: 20));
 
     if (response.statusCode != 200) {
       await logService.error(
           'Authentication failed', 'HTTP ${response.statusCode}');
-      throw Exception('Authentication failed (${response.statusCode}).');
+      throw JellyfinRequestException(response.statusCode == 401 ||
+              response.statusCode == 403
+          ? 'Sign-in failed. Check your password or ask your server administrator.'
+          : 'Could not sign in (${response.statusCode}).');
     }
 
     final payload = jsonDecode(response.body) as Map<String, dynamic>;
@@ -156,6 +191,7 @@ class JellyfinClient {
   /// Verifies that an existing token is accepted at a proposed server address.
   Future<void> validateSession(AuthSession session) async {
     final uri = Uri.parse('${session.serverUrl}/Users/${session.userId}');
+    // A proposed address can reject a token that still works at the active one.
     final response = await _httpClient.get(
       uri,
       headers: _authenticatedHeaders(session),
@@ -196,8 +232,7 @@ class JellyfinClient {
       },
     );
 
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
     if (response.statusCode != 200) {
       throw Exception('Unable to load playlists (${response.statusCode}).');
     }
@@ -246,8 +281,7 @@ class JellyfinClient {
         'Fields': _albumFields,
       },
     );
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
     if (response.statusCode != 200) {
       throw Exception('Unable to load recently added albums.');
     }
@@ -271,8 +305,7 @@ class JellyfinClient {
         'Fields': 'ImageTags,SongCount,AlbumCount',
       },
     );
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
     if (response.statusCode != 200) {
       throw Exception('Unable to load artists (${response.statusCode}).');
     }
@@ -322,8 +355,7 @@ class JellyfinClient {
     );
 
     await logService.info('JellyfinClient: Making HTTP request to ${uri.path}');
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
 
     if (response.statusCode != 200) {
       await logService.error('JellyfinClient: Failed to load playlist tracks',
@@ -362,8 +394,7 @@ class JellyfinClient {
     final uri = Uri.parse('${session.serverUrl}/Playlists').replace(
       queryParameters: params,
     );
-    final response =
-        await _httpClient.post(uri, headers: _authenticatedHeaders(session));
+    final response = await _post(uri, headers: _authenticatedHeaders(session));
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw JellyfinRequestException(
         _errorMessage(
@@ -409,7 +440,7 @@ class JellyfinClient {
         'UserId': session.userId,
       },
     );
-    final response = await _httpClient.post(
+    final response = await _post(
       uri,
       headers: headers,
       body: jsonEncode({'Name': name}),
@@ -425,7 +456,7 @@ class JellyfinClient {
         'UserId': session.userId,
       },
     );
-    final fallbackResponse = await _httpClient.post(
+    final fallbackResponse = await _post(
       fallbackUri,
       headers: headers,
       body: jsonEncode(<String, dynamic>{}),
@@ -452,7 +483,7 @@ class JellyfinClient {
         'UserId': session.userId,
       },
     );
-    final response = await _httpClient.delete(uri, headers: headers);
+    final response = await _delete(uri, headers: headers);
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw JellyfinRequestException(
         _errorMessage(
@@ -494,8 +525,8 @@ class JellyfinClient {
         uri,
         abortTrigger: abortCompleter.future,
       )..headers.addAll(_authenticatedHeaders(session));
-      response =
-          await http.Response.fromStream(await _httpClient.send(request));
+      response = await _checkAuthentication(uri, request.headers,
+          http.Response.fromStream(await _httpClient.send(request)));
     } on http.RequestAbortedException catch (error, stackTrace) {
       await logService.error(
         'JellyfinClient: Add-to-playlist request timed out',
@@ -505,6 +536,8 @@ class JellyfinClient {
       throw JellyfinRequestException(
         'Adding this track to the playlist timed out. Please try again.',
       );
+    } on JellyfinAuthenticationException {
+      rethrow;
     } on Object catch (error, stackTrace) {
       await logService.error(
         'JellyfinClient: Add-to-playlist request failed',
@@ -551,11 +584,11 @@ class JellyfinClient {
     final uri = Uri.parse(
       '${session.serverUrl}/Playlists/$playlistId/Items',
     ).replace(queryParameters: params);
-    final response = await _httpClient.delete(uri, headers: headers);
+    final response = await _delete(uri, headers: headers);
     if (response.statusCode >= 200 && response.statusCode < 300) {
       return;
     }
-    final fallbackResponse = await _httpClient.post(
+    final fallbackResponse = await _post(
       Uri.parse('${session.serverUrl}/Playlists/$playlistId/Items/Delete')
           .replace(
         queryParameters: {
@@ -598,7 +631,7 @@ class JellyfinClient {
           'UserId': session.userId,
         },
       );
-      return _httpClient.post(
+      return _post(
         uri,
         headers: headers,
         body: jsonEncode(<String, dynamic>{}),
@@ -612,7 +645,7 @@ class JellyfinClient {
     final fallbackResponse = await attempt('EntryIds');
     if (fallbackResponse.statusCode < 200 ||
         fallbackResponse.statusCode >= 300) {
-      final bodyResponse = await _httpClient.post(
+      final bodyResponse = await _post(
         Uri.parse(
           '${session.serverUrl}/Playlists/$playlistId/Items/Order',
         ).replace(
@@ -689,8 +722,7 @@ class JellyfinClient {
     );
 
     await logService.info('JellyfinClient: Making HTTP request to ${uri.path}');
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
 
     if (response.statusCode != 200) {
       await logService.error(
@@ -730,8 +762,7 @@ class JellyfinClient {
             'DateCreated,UserData,Genres',
       },
     );
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
     if (response.statusCode != 200) {
       throw Exception('Unable to load artist tracks.');
     }
@@ -762,8 +793,7 @@ class JellyfinClient {
             'DateCreated,UserData,Genres',
       },
     );
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
     if (response.statusCode != 200) {
       throw Exception('Unable to load genre tracks.');
     }
@@ -793,8 +823,7 @@ class JellyfinClient {
         'Fields': _albumFields,
       },
     );
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
     if (response.statusCode != 200) {
       throw Exception('Unable to load favorite albums.');
     }
@@ -830,8 +859,7 @@ class JellyfinClient {
           'Fields': 'ImageTags,SongCount,AlbumCount,UserData',
         },
       );
-      final response =
-          await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+      final response = await _get(uri, headers: _authenticatedHeaders(session));
       if (response.statusCode != 200) {
         if (hadSuccess) {
           break;
@@ -888,8 +916,7 @@ class JellyfinClient {
             'DateCreated,UserData,Genres',
       },
     );
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
     if (response.statusCode != 200) {
       throw Exception('Unable to load favorite tracks.');
     }
@@ -919,15 +946,15 @@ class JellyfinClient {
       '${session.serverUrl}/Users/${session.userId}/FavoriteItems/$itemId',
     );
     final response = isFavorite
-        ? await _httpClient.post(uri, headers: headers)
-        : await _httpClient.delete(uri, headers: headers);
+        ? await _post(uri, headers: headers)
+        : await _delete(uri, headers: headers);
     if (response.statusCode >= 200 && response.statusCode < 300) {
       return;
     }
     final userDataUri = Uri.parse(
       '${session.serverUrl}/Users/${session.userId}/Items/$itemId/UserData',
     );
-    final userDataResponse = await _httpClient.post(
+    final userDataResponse = await _post(
       userDataUri,
       headers: headers,
       body: jsonEncode({'IsFavorite': isFavorite}),
@@ -949,7 +976,7 @@ class JellyfinClient {
     final uri = Uri.parse(
       '${session.serverUrl}/Users/${session.userId}/Items/$itemId/UserData',
     );
-    final response = await _httpClient.get(
+    final response = await _get(
       uri,
       headers: _authenticatedHeaders(session),
     );
@@ -1039,8 +1066,7 @@ class JellyfinClient {
     await LogService.instance
         .then((log) => log.info('Search: GET ${uri.path}?searchTerm=$query'));
 
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
 
     await LogService.instance.then(
         (log) => log.info('Search: Response status ${response.statusCode}'));
@@ -1165,8 +1191,7 @@ class JellyfinClient {
             'DateCreated,UserData,Genres',
       },
     );
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
     if (response.statusCode != 200) {
       throw Exception('Unable to load recent tracks.');
     }
@@ -1198,8 +1223,7 @@ class JellyfinClient {
             'DateCreated,UserData,Genres',
       },
     );
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
     if (response.statusCode != 200) {
       throw Exception('Unable to load recently played tracks.');
     }
@@ -1234,8 +1258,7 @@ class JellyfinClient {
     final uri = Uri.parse(
       '${session.serverUrl}/Users/${session.userId}/Items',
     ).replace(queryParameters: query);
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
     if (response.statusCode != 200) {
       throw Exception('Unable to load tracks.');
     }
@@ -1266,8 +1289,7 @@ class JellyfinClient {
             'DateCreated,UserData,Genres',
       },
     );
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
     if (response.statusCode != 200) {
       return null;
     }
@@ -1298,8 +1320,7 @@ class JellyfinClient {
         'Fields': _albumFields,
       },
     );
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
     if (response.statusCode != 200) {
       return null;
     }
@@ -1325,8 +1346,7 @@ class JellyfinClient {
         'Fields': 'ImageTags,SongCount,AlbumCount',
       },
     );
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
     if (response.statusCode != 200) {
       return null;
     }
@@ -1393,8 +1413,7 @@ class JellyfinClient {
         'JellyfinClient: Fetching $collectionName page $page',
       );
 
-      final response =
-          await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+      final response = await _get(uri, headers: _authenticatedHeaders(session));
       if (response.statusCode != 200) {
         final error = JellyfinRequestException(
           'Unable to load $collectionName (${response.statusCode}).',
@@ -1528,8 +1547,7 @@ class JellyfinClient {
         'Limit': '0',
       },
     );
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
     if (response.statusCode != 200) {
       throw Exception('Unable to load item count for $includeItemTypes.');
     }
@@ -1544,8 +1562,7 @@ class JellyfinClient {
         'Limit': '0',
       },
     );
-    final response =
-        await _httpClient.get(uri, headers: _authenticatedHeaders(session));
+    final response = await _get(uri, headers: _authenticatedHeaders(session));
     if (response.statusCode != 200) {
       throw Exception('Unable to load artist count.');
     }
@@ -1584,17 +1601,17 @@ class JellyfinClient {
       payload['Failed'] = false;
       payload['PlayedToCompletion'] = completed;
     }
-    final response = await _httpClient.post(
-      uri,
-      headers: _authenticatedHeaders(
-        session,
-        contentType: 'application/json',
-      ),
-      body: jsonEncode(payload),
-    );
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      // Telemetry failures should not interrupt playback.
-      return;
+    try {
+      await _post(
+        uri,
+        headers: _authenticatedHeaders(
+          session,
+          contentType: 'application/json',
+        ),
+        body: jsonEncode(payload),
+      );
+    } on JellyfinAuthenticationException {
+      // The sign-in callback handles recovery without interrupting playback.
     }
   }
 }
@@ -1606,4 +1623,11 @@ class JellyfinRequestException implements Exception {
 
   @override
   String toString() => 'JellyfinRequestException: $message';
+}
+
+class JellyfinAuthenticationException extends JellyfinRequestException {
+  JellyfinAuthenticationException(this.session)
+      : super('Sign in again to access this server.');
+
+  final AuthSession session;
 }
