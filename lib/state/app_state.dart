@@ -71,6 +71,21 @@ List<MediaItem> _tracksForAlbumId(
 /// Identifies work by both transition and session, including address changes.
 typedef _ServerGeneration = ({int revision, AuthSession? session});
 
+typedef _BrowseHistoryEntry = ({
+  LibraryView view,
+  Playlist? playlist,
+  SmartList? smartList,
+  Album? album,
+  Artist? artist,
+  Genre? genre,
+  List<MediaItem> playlistTracks,
+  List<MediaItem> smartListTracks,
+  List<MediaItem> albumTracks,
+  List<MediaItem> artistTracks,
+  List<MediaItem> genreTracks,
+  bool offlineOnly,
+});
+
 /// Central application state and Jellyfin coordination.
 class AppState extends ChangeNotifier {
   /// Creates the shared application state.
@@ -404,7 +419,7 @@ class AppState extends ChangeNotifier {
   double _sidebarWidth = 240;
   bool _sidebarCollapsed = false;
   bool _sidebarOverlayOpen = false;
-  final List<LibraryView> _viewHistory = [];
+  final List<_BrowseHistoryEntry> _viewHistory = [];
   final Map<LibraryView, BrowseLayout> _browseLayouts = {};
   final Map<String, double> _scrollOffsets = {};
 
@@ -865,27 +880,40 @@ class AppState extends ChangeNotifier {
   }
 
   void _recordViewHistory(LibraryView view) {
-    if (_viewHistory.isNotEmpty && _viewHistory.last == view) {
-      return;
+    if (_viewHistory.isNotEmpty) {
+      final last = _viewHistory.last;
+      if (last.view == view &&
+          last.playlist == _selectedPlaylist &&
+          last.smartList == _selectedSmartList &&
+          last.album == _selectedAlbum &&
+          last.artist == _selectedArtist &&
+          last.genre == _selectedGenre &&
+          last.offlineOnly == _offlineOnlyFilter) {
+        return;
+      }
     }
-    _viewHistory.add(view);
+    _viewHistory.add((
+      view: view,
+      playlist: _selectedPlaylist,
+      smartList: _selectedSmartList,
+      album: _selectedAlbum,
+      artist: _selectedArtist,
+      genre: _selectedGenre,
+      playlistTracks: List.of(_playlistTracks),
+      smartListTracks: List.of(_smartListTracks),
+      albumTracks: List.of(_albumTracks),
+      artistTracks: List.of(_artistTracks),
+      genreTracks: List.of(_genreTracks),
+      offlineOnly: _offlineOnlyFilter,
+    ));
     if (_viewHistory.length > 20) {
       _viewHistory.removeAt(0);
     }
   }
 
-  bool get _hasSelectedDetail =>
-      _selectedPlaylist != null ||
-      _selectedSmartList != null ||
-      _selectedAlbum != null ||
-      _selectedArtist != null ||
-      _selectedGenre != null;
-
-  /// Records the list or Home view that opened a detail screen.
+  /// Records the screen that opened a detail, including nested detail pages.
   void _recordDetailEntry() {
-    if (!_hasSelectedDetail) {
-      _recordViewHistory(_selectedView);
-    }
+    _recordViewHistory(_selectedView);
   }
 
   int _comparePlaylists(Playlist a, Playlist b) {

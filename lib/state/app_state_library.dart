@@ -7,8 +7,8 @@ extension AppStateLibraryExtension on AppState {
     bool offlineOnly = false,
   }) async {
     final generation = _captureServerGeneration();
-    _recordDetailEntry();
     final isSamePlaylist = _selectedPlaylist?.id == playlist.id;
+    if (!isSamePlaylist) _recordDetailEntry();
     _selectedPlaylist = playlist;
     _selectedSmartList = null;
     _smartListTracks = [];
@@ -91,8 +91,8 @@ extension AppStateLibraryExtension on AppState {
 
   /// Selects a Smart List and loads its tracks.
   Future<void> selectSmartList(SmartList list) async {
-    _recordDetailEntry();
     final isSameSmartList = _selectedSmartList?.id == list.id;
+    if (!isSameSmartList) _recordDetailEntry();
     _selectedSmartList = list;
     _selectedView = LibraryView.home;
     _offlineOnlyFilter = false;
@@ -474,7 +474,28 @@ extension AppStateLibraryExtension on AppState {
       return;
     }
     final previous = _viewHistory.removeLast();
-    selectLibraryView(previous, recordHistory: false);
+    if (previous.playlist == null &&
+        previous.smartList == null &&
+        previous.album == null &&
+        previous.artist == null &&
+        previous.genre == null) {
+      selectLibraryView(previous.view, recordHistory: false);
+      return;
+    }
+    _selectedView = previous.view;
+    clearSearch(notify: false);
+    _selectedPlaylist = previous.playlist;
+    _selectedSmartList = previous.smartList;
+    _selectedAlbum = previous.album;
+    _selectedArtist = previous.artist;
+    _selectedGenre = previous.genre;
+    _playlistTracks = previous.playlistTracks;
+    _smartListTracks = previous.smartListTracks;
+    _albumTracks = previous.albumTracks;
+    _artistTracks = previous.artistTracks;
+    _genreTracks = previous.genreTracks;
+    _offlineOnlyFilter = previous.offlineOnly;
+    _notify();
   }
 
   /// Navigates to an album by identifier.
@@ -1519,8 +1540,8 @@ extension AppStateLibraryExtension on AppState {
   /// Selects an album and loads its tracks.
   Future<void> selectAlbum(Album album, {bool offlineOnly = false}) async {
     final generation = _captureServerGeneration();
-    _recordDetailEntry();
     final isSameAlbum = _selectedAlbum?.id == album.id;
+    if (!isSameAlbum) _recordDetailEntry();
     _selectedPlaylist = null;
     _playlistTracks = [];
     _selectedSmartList = null;
@@ -1623,8 +1644,8 @@ extension AppStateLibraryExtension on AppState {
   /// Selects an artist and loads their tracks.
   Future<void> selectArtist(Artist artist, {bool offlineOnly = false}) async {
     final generation = _captureServerGeneration();
-    _recordDetailEntry();
     final isSameArtist = _selectedArtist?.id == artist.id;
+    if (!isSameArtist) _recordDetailEntry();
     _selectedPlaylist = null;
     _playlistTracks = [];
     _selectedSmartList = null;
@@ -1693,8 +1714,8 @@ extension AppStateLibraryExtension on AppState {
   /// Selects a genre and loads its tracks.
   Future<void> selectGenre(Genre genre) async {
     final generation = _captureServerGeneration();
-    _recordDetailEntry();
     final isSameGenre = _selectedGenre?.id == genre.id;
+    if (!isSameGenre) _recordDetailEntry();
     _selectedPlaylist = null;
     _playlistTracks = [];
     _selectedSmartList = null;
