@@ -1,6 +1,26 @@
 part of 'app_state.dart';
 
 extension AppStateSessionExtension on AppState {
+  void _requireSignIn(AuthSession session) {
+    if (_disposed || !identical(_session, session) || needsSignIn) return;
+    _rejectedSession = session;
+    _downloadRetryTimer?.cancel();
+    _notify();
+    unawaited(_cacheStore.cancelDownloads().catchError((Object error) async {
+      final log = await LogService.instance;
+      await log.warning('Could not stop unauthorized downloads: $error');
+    }));
+  }
+
+  /// Refreshes credentials without removing the saved profile or its files.
+  Future<bool> reauthenticateServer(SavedServer server,
+          {required String password}) =>
+      signIn(
+          serverUrl: server.activeAddress.url,
+          username: server.userName,
+          password: password,
+          expectedUserId: server.userId);
+
   /// Initializes cached state and refreshes library.
   Future<void> bootstrap() async {
     await AppInfo.load();
@@ -111,6 +131,7 @@ extension AppStateSessionExtension on AppState {
     required String username,
     required String password,
     String? serverName,
+    String? expectedUserId,
   }) async {
     var transition = _captureServerGeneration();
     _authError = null;
@@ -125,6 +146,10 @@ extension AppStateSessionExtension on AppState {
       // currently active profile until the new profile is ready to activate.
       _restoreClientSession();
       if (!_isCurrentServerGeneration(transition)) return false;
+      if (expectedUserId != null && session.userId != expectedUserId) {
+        throw JellyfinRequestException(
+            'Sign in with the saved account to keep its offline library.');
+      }
       final stored = await _serverStore.addAuthenticatedServer(
         session,
         name: serverName,
@@ -142,6 +167,7 @@ extension AppStateSessionExtension on AppState {
         stored,
         refresh: true,
         serverGeneration: transition,
+        retryAuthenticationFailures: true,
       );
       return transition.revision == _serverGeneration;
     } catch (error, stackTrace) {
@@ -149,7 +175,11 @@ extension AppStateSessionExtension on AppState {
       final logService = await LogService.instance;
       await logService.error('Sign in failed', error, stackTrace);
       if (_isCurrentServerGeneration(transition)) {
-        _authError = error.toString();
+        _authError = error is JellyfinRequestException
+            ? error.message
+            : error is TimeoutException
+                ? 'The server took too long to respond. Try again.'
+                : error.toString();
         _notify();
       }
       return false;
@@ -361,6 +391,7 @@ extension AppStateSessionExtension on AppState {
     StoredServerSession stored, {
     required bool refresh,
     _ServerGeneration? serverGeneration,
+    bool retryAuthenticationFailures = false,
   }) async {
     if (!_isCurrentServerGeneration(
         serverGeneration ?? _captureServerGeneration())) {
@@ -375,7 +406,8 @@ extension AppStateSessionExtension on AppState {
     final storedPinnedAudio = await _cacheStore.loadPinnedAudio();
     if (!_isCurrentServerGeneration(generation)) return;
     _pinnedAudio = storedPinnedAudio.toSet();
-    await _restoreDownloadQueue();
+    await _restoreDownloadQueue(
+        retryAuthenticationFailures: retryAuthenticationFailures);
     if (!_isCurrentServerGeneration(generation)) return;
     await refreshMediaCacheBytes();
     await _loadCachedLibrary();
@@ -565,6 +597,9 @@ extension AppStateSessionExtension on AppState {
       }
     } catch (error, stackTrace) {
       if (!_isCurrentServerGeneration(serverGeneration)) return;
+      if (error is JellyfinAuthenticationException) {
+        _requireSignIn(error.session);
+      }
       final logService = await LogService.instance;
       await logService.error('Library refresh failed', error, stackTrace);
       if (!_isCurrentServerGeneration(serverGeneration)) return;

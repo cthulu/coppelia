@@ -138,4 +138,41 @@ void main() {
           (await relaunched.restore(saved, key)).status, DownloadStatus.queued);
     });
   }
+
+  test(
+      'restored unauthorized downloads wait for sign-in and accept new credentials',
+      () async {
+    const key = 'server:audio:auth';
+    const oldHeaders = {'Authorization': 'old-token'};
+    final nativeTask = bg.DownloadTask(
+        taskId: audioFileId(key),
+        url: 'https://example.com/audio',
+        headers: oldHeaders);
+    final database = native.database;
+    when(() => database.allRecords(group: any(named: 'group')))
+        .thenAnswer((_) async => [
+              bg.TaskRecord(nativeTask, bg.TaskStatus.failed, 0, -1,
+                  bg.TaskHttpException('unauthorized', 401)),
+            ]);
+    final task = DownloadTask(
+        track: const MediaItem(
+            id: 'auth',
+            title: 'Auth',
+            album: 'Album',
+            artists: [],
+            duration: Duration.zero,
+            imageUrl: null,
+            streamUrl: 'https://example.com/audio'),
+        status: DownloadStatus.queued,
+        queuedAt: DateTime(2026),
+        userInitiated: true,
+        requiresWifi: true);
+    final blocked = await downloads.restore(task, key, headers: oldHeaders);
+    expect(blocked.status, DownloadStatus.waitingForSignIn);
+    final resumed = await downloads
+        .restore(blocked, key, headers: {'Authorization': 'new-token'});
+    expect(resumed.status, DownloadStatus.queued);
+    expect(resumed.requiresWifi, isTrue);
+    expect(resumed.userInitiated, isTrue);
+  });
 }

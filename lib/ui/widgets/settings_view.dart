@@ -32,6 +32,7 @@ import 'compact_switch.dart';
 import 'corner_radius.dart';
 import 'glass_container.dart';
 import 'header_controls.dart';
+import 'server_error_banner.dart';
 
 /// Settings view for Coppelia preferences.
 class SettingsView extends StatelessWidget {
@@ -1779,6 +1780,7 @@ class _DownloadQueueList extends StatelessWidget {
           break;
         case DownloadStatus.waitingForWifi:
         case DownloadStatus.waitingToRetry:
+        case DownloadStatus.waitingForSignIn:
           waiting += 1;
           break;
         case DownloadStatus.failed:
@@ -1926,13 +1928,22 @@ class _DownloadQueueRow extends StatelessWidget {
               ),
             ),
             Expanded(
-              child: Text(
-                line,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: Theme.of(context).textTheme.bodyMedium,
+              child: Tooltip(
+                message: task.errorMessage ?? line,
+                child: Text(
+                  line,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodyMedium,
+                ),
               ),
             ),
+            if (task.status == DownloadStatus.waitingForSignIn)
+              IconButton(
+                onPressed: () => showServerSignIn(context),
+                icon: const Icon(Icons.login, size: 18),
+                tooltip: 'Sign in again',
+              ),
             if (task.status == DownloadStatus.failed ||
                 task.status == DownloadStatus.stopped) ...[
               const SizedBox(width: 6),
@@ -1949,6 +1960,7 @@ class _DownloadQueueRow extends StatelessWidget {
   }
 
   String _statusLabel(DownloadTask task, bool isPaused) {
+    if (task.status == DownloadStatus.waitingForSignIn) return 'Sign in again';
     if (isPaused &&
         task.status != DownloadStatus.downloading &&
         task.status != DownloadStatus.failed) {
@@ -2276,6 +2288,7 @@ class _ServerSettings extends StatelessWidget {
                   server.activeAddress.id,
                 ),
                 onRename: () => _renameServer(context, server),
+                onSignIn: () => showServerSignIn(context, server: server),
                 onAddAddress: () => _addAddress(context, server),
                 onSelectAddress: (address) => _switchTo(
                   context,
@@ -2353,6 +2366,7 @@ class _SavedServerCard extends StatelessWidget {
     required this.isActive,
     required this.onSelect,
     required this.onRename,
+    required this.onSignIn,
     required this.onAddAddress,
     required this.onSelectAddress,
     required this.onEditAddress,
@@ -2364,6 +2378,7 @@ class _SavedServerCard extends StatelessWidget {
   final bool isActive;
   final VoidCallback onSelect;
   final VoidCallback onRename;
+  final VoidCallback onSignIn;
   final VoidCallback onAddAddress;
   final ValueChanged<ServerAddress> onSelectAddress;
   final ValueChanged<ServerAddress> onEditAddress;
@@ -2428,6 +2443,8 @@ class _SavedServerCard extends StatelessWidget {
                 tooltip: 'Server actions',
                 onSelected: (action) {
                   switch (action) {
+                    case _ServerMenuAction.signIn:
+                      onSignIn();
                     case _ServerMenuAction.rename:
                       onRename();
                     case _ServerMenuAction.remove:
@@ -2435,6 +2452,10 @@ class _SavedServerCard extends StatelessWidget {
                   }
                 },
                 itemBuilder: (context) => const [
+                  PopupMenuItem(
+                    value: _ServerMenuAction.signIn,
+                    child: Text('Sign in again'),
+                  ),
                   PopupMenuItem(
                     value: _ServerMenuAction.rename,
                     child: Text('Rename server'),
@@ -2567,7 +2588,7 @@ class _ServerAddressRow extends StatelessWidget {
   }
 }
 
-enum _ServerMenuAction { rename, remove }
+enum _ServerMenuAction { signIn, rename, remove }
 
 enum _AddressMenuAction { edit, remove }
 

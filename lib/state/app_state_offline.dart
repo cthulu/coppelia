@@ -22,7 +22,7 @@ extension AppStateOfflineExtension on AppState {
 
   void _scheduleRetryWakeup() {
     _downloadRetryTimer?.cancel();
-    if (_downloadsPaused || _offlineMode) return;
+    if (_downloadsPaused || _offlineMode || needsSignIn) return;
     final times = _downloadQueue
         .where((task) => task.status == DownloadStatus.waitingToRetry)
         .map((task) => task.retryAt ?? DateTime.now())
@@ -35,7 +35,7 @@ extension AppStateOfflineExtension on AppState {
   }
 
   Future<void> _recoverDownloads() async {
-    if (_recoveringDownloads || _session == null) return;
+    if (_recoveringDownloads || _session == null || needsSignIn) return;
     _recoveringDownloads = true;
     final generation = _captureServerGeneration();
     try {
@@ -56,7 +56,8 @@ extension AppStateOfflineExtension on AppState {
     }
   }
 
-  Future<void> _restoreDownloadQueue() async {
+  Future<void> _restoreDownloadQueue(
+      {bool retryAuthenticationFailures = false}) async {
     final generation = _captureServerGeneration();
     await _cacheStore.backgroundDownloads?.activateScope(_activeServer?.id,
         paused: _downloadsPaused || _offlineMode);
@@ -71,13 +72,24 @@ extension AppStateOfflineExtension on AppState {
       final cached = await _cacheStore.isAudioCached(normalized.track);
       if (!_isCurrentServerGeneration(generation)) return;
       if (cached) continue;
-      final restored = await _cacheStore.backgroundDownloads
+      var restored = await _cacheStore.backgroundDownloads
               ?.restore(normalized, key, headers: _playbackHeaders()) ??
           normalized;
       if (!_isCurrentServerGeneration(generation)) return;
+      if (restored.status == DownloadStatus.waitingForSignIn &&
+          retryAuthenticationFailures) {
+        await _cacheStore.backgroundDownloads?.prepareRetry(key);
+        if (!_isCurrentServerGeneration(generation)) return;
+        restored = restored.reset(userInitiated: restored.userInitiated);
+      }
       _addDownloadTask(restored.status == DownloadStatus.downloading
           ? restored.copyWith(status: DownloadStatus.queued)
           : restored);
+    }
+    if (_session != null &&
+        _downloadQueue
+            .any((task) => task.status == DownloadStatus.waitingForSignIn)) {
+      _requireSignIn(_session!);
     }
   }
 
@@ -561,6 +573,7 @@ extension AppStateOfflineExtension on AppState {
   void _replaceDownloadTaskAt(int index, DownloadTask task) {
     if (_downloadQueue[index].status != task.status &&
         (task.status == DownloadStatus.failed ||
+            task.status == DownloadStatus.waitingForSignIn ||
             task.status == DownloadStatus.stopped ||
             task.status == DownloadStatus.waitingToRetry)) {
       _scheduleDownloadSave();
@@ -746,7 +759,10 @@ extension AppStateOfflineExtension on AppState {
   }
 
   Future<void> _processDownloadQueue() async {
-    if (_isProcessingDownloads || _downloadsPaused || _offlineMode) {
+    if (_isProcessingDownloads ||
+        _downloadsPaused ||
+        _offlineMode ||
+        needsSignIn) {
       return;
     }
     final serverGeneration = _captureServerGeneration();
@@ -758,6 +774,7 @@ extension AppStateOfflineExtension on AppState {
       while (true) {
         if (_downloadsPaused ||
             _offlineMode ||
+            needsSignIn ||
             !_isCurrentServerGeneration(serverGeneration)) {
           break;
         }
@@ -815,6 +832,7 @@ extension AppStateOfflineExtension on AppState {
     if (!_isCurrentServerGeneration(serverGeneration)) return;
     if (_downloadsPaused ||
         _offlineMode ||
+        needsSignIn ||
         _isOfflineRequestCancelled(task.track.streamUrl)) {
       _activeDownloads.remove(_audioKey(task.track.streamUrl));
       return;
@@ -888,6 +906,13 @@ extension AppStateOfflineExtension on AppState {
         _updateDownloadTask(streamUrl,
             status: DownloadStatus.stopped,
             errorMessage: 'Download stopped. Tap retry to continue.');
+        return;
+      }
+      if (error is AudioDownloadFailure && error.requiresSignIn) {
+        _updateDownloadTask(streamUrl,
+            status: DownloadStatus.waitingForSignIn,
+            errorMessage: error.message);
+        if (_session != null) _requireSignIn(_session!);
         return;
       }
       final retryable = error is SocketException ||

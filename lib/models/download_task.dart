@@ -17,6 +17,8 @@ enum DownloadStatus {
   waitingToRetry,
 
   stopped,
+
+  waitingForSignIn,
 }
 
 /// Represents a queued audio download with progress metadata.

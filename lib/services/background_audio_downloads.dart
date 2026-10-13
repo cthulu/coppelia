@@ -13,10 +13,11 @@ import '../models/download_task.dart';
 /// A transport failure safe to show without exposing URLs or auth headers.
 class AudioDownloadFailure implements Exception {
   const AudioDownloadFailure(this.message,
-      {this.retryable = false, this.retryAfter});
+      {this.retryable = false, this.retryAfter, this.requiresSignIn = false});
   final String message;
   final bool retryable;
   final Duration? retryAfter;
+  final bool requiresSignIn;
   @override
   String toString() => message;
 }
@@ -344,7 +345,9 @@ class BackgroundAudioDownloads {
       } catch (_) {}
     }
     final message = switch (code) {
-      401 || 403 => 'Sign in again to download this song.',
+      401 => 'Sign in again to download this song.',
+      403 =>
+        'The server denied access to this song. Check your account permissions.',
       404 => 'This song is no longer on the server.',
       _ when error is bg.TaskFileSystemException =>
         'Could not save the song. Check available storage.',
@@ -352,7 +355,9 @@ class BackgroundAudioDownloads {
       _ => 'Download failed. Retry from Downloads.',
     };
     return AudioDownloadFailure(message,
-        retryable: transient, retryAfter: retryAfter);
+        retryable: transient,
+        retryAfter: retryAfter,
+        requiresSignIn: code == 401);
   }
 
   Future<void> cancel({String? key, Set<String>? keys, String? scope}) async {
@@ -409,6 +414,7 @@ class BackgroundAudioDownloads {
     if (record == null) return task;
     if (await (await _suspensionFile(record.taskId)).exists()) {
       return task.status == DownloadStatus.failed ||
+              task.status == DownloadStatus.waitingForSignIn ||
               task.status == DownloadStatus.stopped
           ? task.reset()
           : task;
@@ -421,7 +427,7 @@ class BackgroundAudioDownloads {
         record.status == bg.TaskStatus.notFound) {
       final error = record.exception;
       if (error is bg.TaskHttpException &&
-          (error.httpResponseCode == 401 || error.httpResponseCode == 403) &&
+          error.httpResponseCode == 401 &&
           headers != null &&
           !mapEquals(record.task.headers, headers)) {
         return task.reset(userInitiated: task.userInitiated);
@@ -429,9 +435,11 @@ class BackgroundAudioDownloads {
       final failure = failureFor(
           bg.TaskStatusUpdate(record.task, record.status, record.exception));
       return task.copyWith(
-          status: failure.retryable && task.attempts < 5
-              ? DownloadStatus.waitingToRetry
-              : DownloadStatus.failed,
+          status: failure.requiresSignIn
+              ? DownloadStatus.waitingForSignIn
+              : failure.retryable && task.attempts < 5
+                  ? DownloadStatus.waitingToRetry
+                  : DownloadStatus.failed,
           retryableFailure: failure.retryable,
           errorMessage: failure.message);
     }
