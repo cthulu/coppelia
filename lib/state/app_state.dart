@@ -1132,6 +1132,7 @@ class AppState extends ChangeNotifier {
       notifyListeners();
       return;
     }
+    _persistPlaybackResumeState(force: true);
     if (wasPlaying) {
       await _performPlaybackAction(
         () => _playback.play(),
@@ -1156,6 +1157,7 @@ class AppState extends ChangeNotifier {
       cacheStore: _cacheStore,
       headers: _playbackHeaders(),
     );
+    _persistPlaybackResumeState(force: true);
     notifyListeners();
   }
 
@@ -1177,6 +1179,7 @@ class AppState extends ChangeNotifier {
       cacheStore: _cacheStore,
       headers: _playbackHeaders(),
     );
+    _persistPlaybackResumeState(force: true);
     notifyListeners();
   }
 
@@ -1201,6 +1204,7 @@ class AppState extends ChangeNotifier {
     if (currentIndex + 1 < _queue.length) {
       _queue = _queue.sublist(0, currentIndex + 1);
     }
+    _persistPlaybackResumeState(force: true);
     notifyListeners();
   }
 
@@ -1346,6 +1350,7 @@ class AppState extends ChangeNotifier {
         index == previousIndex) {
       return;
     }
+    _persistPlaybackResumeState(force: true);
     if (_offlineMode || _downloadsPaused) return;
     unawaited(
       _cacheStore.handlePlaybackAdvance(
@@ -1386,8 +1391,10 @@ class AppState extends ChangeNotifier {
     if (!_isCurrentServerGeneration(generation) || resume == null) {
       return;
     }
-    final track = _normalizeTrackForPlayback(resume.track);
-    _queue = [track];
+    final tracks = resume.queue.isEmpty ? [resume.track] : resume.queue;
+    _queue = _normalizeTracksForPlayback(tracks);
+    final index = resume.currentIndex.clamp(0, _queue.length - 1);
+    final track = _queue[index];
     _nowPlaying = track;
     _updatePlaybackProgress(
       position: resume.position,
@@ -1402,7 +1409,7 @@ class AppState extends ChangeNotifier {
     try {
       await _playback.setQueue(
         _queue,
-        startIndex: 0,
+        startIndex: index,
         startPosition: _position,
         cacheStore: _cacheStore,
         headers: _playbackHeaders(),
@@ -1430,8 +1437,24 @@ class AppState extends ChangeNotifier {
     _lastPlaybackPersistAt = now;
     unawaited(
       _cacheStore.savePlaybackResumeState(
-        PlaybackResumeState(track: track, position: _position),
+        _playbackResumeSnapshot(track),
       ),
+    );
+  }
+
+  PlaybackResumeState _playbackResumeSnapshot(MediaItem track) {
+    var index = _playback.currentIndex;
+    if (index == null ||
+        index < 0 ||
+        index >= _queue.length ||
+        _queue[index].id != track.id) {
+      index = _queue.indexWhere((item) => identical(item, track));
+    }
+    return PlaybackResumeState(
+      track: index < 0 ? track : _queue[index],
+      position: _position,
+      queue: index < 0 ? [track] : List.of(_queue),
+      currentIndex: index < 0 ? 0 : index,
     );
   }
 

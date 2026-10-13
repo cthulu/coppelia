@@ -1787,6 +1787,65 @@ void main() {
     expect(h.state.activeServer!.id, 'server-3');
   });
 
+  test('restoring playback keeps the full queue, index and position', () async {
+    final h = await buildServerRaceState();
+    final queue = [_track('previous'), _track('current'), _track('next')];
+    when(() => h.cache.loadPlaybackResumeState()).thenAnswer(
+      (_) async => PlaybackResumeState(
+        track: queue[1],
+        queue: queue,
+        currentIndex: 1,
+        position: const Duration(seconds: 42),
+      ),
+    );
+    await h.state.switchServer('server-2', addressId: 'address-2');
+    expect(h.state.queue.map((item) => item.id), [
+      'previous',
+      'current',
+      'next',
+    ]);
+    expect(h.state.nowPlaying?.id, 'current');
+    final call = verify(
+      () => h.playback.setQueue(
+        captureAny(),
+        startIndex: 1,
+        startPosition: const Duration(seconds: 42),
+        cacheStore: any(named: 'cacheStore'),
+        headers: any(named: 'headers'),
+      ),
+    ).captured.single as List<MediaItem>;
+    expect(
+      call.map((item) => Uri.parse(item.streamUrl).host),
+      everyElement('remote.example.com'),
+    );
+  });
+  test('editing a paused queue saves its next song and current index',
+      () async {
+    final h = await buildServerRaceState();
+    when(() => h.cache.savePlaybackResumeState(any())).thenAnswer((_) async {});
+    final repeated = _track('repeat');
+    when(() => h.cache.loadPlaybackResumeState()).thenAnswer((_) async =>
+        PlaybackResumeState(
+            track: repeated,
+            queue: [repeated, _track('middle'), repeated],
+            currentIndex: 2,
+            position: const Duration(seconds: 42)));
+    await h.state.switchServer('server-2', addressId: 'address-2');
+    when(() => h.playback.currentIndex).thenReturn(2);
+    when(() => h.playback.appendToQueue(any(),
+        cacheStore: any(named: 'cacheStore'),
+        headers: any(named: 'headers'))).thenAnswer((_) async {});
+    clearInteractions(h.cache);
+    await h.state.enqueueTrack(_track('next'));
+    final saved = verify(() => h.cache.savePlaybackResumeState(captureAny()))
+        .captured
+        .last as PlaybackResumeState;
+    expect(saved.queue.map((item) => item.id),
+        ['repeat', 'middle', 'repeat', 'next']);
+    expect(saved.currentIndex, 2);
+    expect(saved.position, const Duration(seconds: 42));
+  });
+
   test('address switching must rebuild the restored playback URL', () async {
     final h = await buildServerRaceState();
     final alias = _savedServer.copyWith(addresses: [

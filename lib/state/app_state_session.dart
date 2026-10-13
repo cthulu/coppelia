@@ -438,7 +438,7 @@ extension AppStateSessionExtension on AppState {
     final track = _nowPlaying;
     if (track != null) {
       await _cacheStore.savePlaybackResumeState(
-        PlaybackResumeState(track: track, position: _position),
+        _playbackResumeSnapshot(track),
       );
       if (!_isCurrentServerGeneration(serverGeneration)) {
         return;
