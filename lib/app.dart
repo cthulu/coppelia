@@ -13,6 +13,7 @@ import 'services/playback_controller.dart';
 import 'services/linux_audio_handler.dart';
 import 'services/server_store.dart';
 import 'services/settings_store.dart';
+import 'services/chromecast_service.dart';
 import 'state/app_state.dart';
 import 'state/library_view.dart';
 import 'ui/screens/home_screen.dart';
@@ -44,6 +45,7 @@ class CoppeliaApp extends StatelessWidget {
             playback: playback,
             serverStore: serverStore,
             settingsStore: settingsStore,
+            chromecast: ChromecastService.instance,
           );
           if (Platform.isLinux) {
             AudioService.init(
