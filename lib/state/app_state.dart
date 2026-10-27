@@ -165,12 +165,33 @@ class AppState extends ChangeNotifier {
     final session = _session;
     if (service == null || track == null || session == null) return;
     final wasPlaying = _isPlaying;
-    await _castTrackToReceiver(
-      track,
-      position: _position,
-      autoPlay: wasPlaying,
-    );
-    await _playback.pause();
+    try {
+      await _castTrackToReceiver(
+        track,
+        position: _position,
+        autoPlay: wasPlaying,
+      );
+      await _playback.pause();
+      // From this point on the receiver, not the local player, owns these
+      // values. The local pause event must not make the cast controls stale.
+      _isPreparingPlayback = false;
+      _isPlaying = _castPlaying;
+      notifyListeners();
+    } catch (_) {
+      _castPlaying = false;
+      _isPreparingPlayback = false;
+      // A failed LOAD leaves the Cast connection alive but without a usable
+      // media session. Do not leave the controls routing play/pause commands
+      // to that dead session.
+      try {
+        await service.disconnect();
+      } catch (_) {
+        // The original LOAD error is more useful to the caller.
+      }
+      _isPlayingNotifier.value = _isPlaying;
+      notifyListeners();
+      rethrow;
+    }
   }
 
   Future<void> _castTrackToReceiver(
@@ -203,10 +224,13 @@ class AppState extends ChangeNotifier {
       track,
       streamUrl: localFile == null ? uri.toString() : null,
       localFilePath: localFile?.path,
+      httpHeaders: localFile == null ? _playbackHeaders() : null,
       startPosition: position,
       autoPlay: autoPlay,
     );
     _castPlaying = autoPlay;
+    _isPlaying = autoPlay;
+    _isPlayingNotifier.value = autoPlay;
     _bindCastPlaybackStreams();
   }
 
@@ -775,7 +799,7 @@ class AppState extends ChangeNotifier {
   ValueListenable<Duration> get durationListenable => _durationNotifier;
 
   /// True when audio is playing.
-  bool get isPlaying => _isPlaying;
+  bool get isPlaying => isCasting ? _castPlaying : _isPlaying;
 
   /// Listenable play/pause updates.
   ValueListenable<bool> get isPlayingListenable => _isPlayingNotifier;
@@ -1172,6 +1196,8 @@ class AppState extends ChangeNotifier {
         await cast!.play();
         _castPlaying = true;
       }
+      _isPlaying = _castPlaying;
+      _isPlayingNotifier.value = _castPlaying;
       notifyListeners();
       return;
     }
@@ -1490,6 +1516,15 @@ class AppState extends ChangeNotifier {
   Future<void> _disposePlayback() async {
     if (_playbackDisposed) return;
     _playbackDisposed = true;
+    // App shutdown must stop the receiver before the Dart process and Cast
+    // socket disappear. Do this directly instead of disconnectCasting(),
+    // which intentionally restores local playback for an interactive
+    // handoff.
+    try {
+      await _chromecast?.disconnect();
+    } catch (_) {
+      // Shutdown must continue even if the receiver is already unreachable.
+    }
     try {
       await _playback.pause();
     } catch (_) {
@@ -1500,6 +1535,15 @@ class AppState extends ChangeNotifier {
     } catch (_) {
       // Shutdown errors must not keep the application alive.
     }
+  }
+
+  /// Disposes the playback engine and returns when it is fully shut down.
+  ///
+  /// Used by [onExitRequested] to block app termination until the media
+  /// backend (mpv) has cleanly stopped, preventing use-after-free crashes.
+  Future<void> disposePlayback() async {
+    if (_playbackDisposed) return;
+    await _disposePlayback();
   }
 
   void _bindPlayback() {

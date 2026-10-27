@@ -112,92 +112,87 @@ Future<void> _showChromecastPicker(BuildContext context) async {
           stream: service.devicesStream,
           builder: (context, snapshot) {
             final devices = snapshot.data ?? const <ChromecastReceiver>[];
-            return ConstrainedBox(
-              constraints: const BoxConstraints(maxHeight: 360),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const ListTile(title: Text('Cast audio to')),
-                  FutureBuilder<void>(
-                    future: spinnerDelay,
-                    builder: (context, delaySnapshot) {
-                      final showSpinner =
-                          delaySnapshot.connectionState == ConnectionState.done;
-                      if (devices.isEmpty) {
-                        return SizedBox(
-                          height: showSpinner ? 112 : 96,
-                          child: showSpinner
-                              ? const Column(
-                                  mainAxisAlignment: MainAxisAlignment.center,
-                                  children: [
-                                    SizedBox(
-                                      width: 24,
-                                      height: 24,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 2,
-                                      ),
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const ListTile(title: Text('Cast audio to')),
+                FutureBuilder<void>(
+                  future: spinnerDelay,
+                  builder: (context, delaySnapshot) {
+                    final showSpinner =
+                        delaySnapshot.connectionState == ConnectionState.done;
+                    if (devices.isEmpty) {
+                      return SizedBox(
+                        height: showSpinner ? 112 : 96,
+                        child: showSpinner
+                            ? const Column(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                children: [
+                                  SizedBox(
+                                    width: 24,
+                                    height: 24,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
                                     ),
-                                    SizedBox(height: 12),
-                                    Text('Looking for Chromecast receivers…'),
-                                  ],
-                                )
-                              : null,
-                        );
-                      }
-                      return ListView(
-                        shrinkWrap: true,
-                        children: [
-                          ...devices.map(
-                            (device) => ListTile(
-                              leading: const Icon(Icons.cast),
-                              title: Text(device.name),
-                              subtitle: Text(device.model ?? 'Chromecast'),
-                              onTap: () async {
-                                Navigator.of(context).pop();
-                                try {
-                                  await service.connect(device);
-                                  if (state.nowPlaying == null) {
+                                  ),
+                                  SizedBox(height: 12),
+                                  Text('Looking for Chromecast receivers…'),
+                                ],
+                              )
+                            : null,
+                      );
+                    }
+                    return Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: devices
+                          .map((device) => ListTile(
+                                leading: const Icon(Icons.cast),
+                                title: Text(device.name),
+                                subtitle: Text(device.model ?? 'Chromecast'),
+                                onTap: () async {
+                                  Navigator.of(context).pop();
+                                  try {
+                                    await service.connect(device);
+                                    if (state.nowPlaying == null) {
+                                      if (context.mounted) {
+                                        showAppSnack(
+                                          context,
+                                          'Start a track before casting audio.',
+                                        );
+                                      }
+                                      return;
+                                    }
+                                    await state.castNowPlaying();
+                                  } catch (error, stackTrace) {
+                                    unawaited(
+                                      LogService.instance.then(
+                                        (log) => log.error(
+                                          'Chromecast cast failed',
+                                          error,
+                                          stackTrace,
+                                        ),
+                                      ),
+                                    );
                                     if (context.mounted) {
                                       showAppSnack(
                                         context,
-                                        'Start a track before casting audio.',
+                                        _chromecastErrorMessage(error),
                                       );
                                     }
-                                    return;
                                   }
-                                  await state.castNowPlaying();
-                                } catch (error, stackTrace) {
-                                  unawaited(
-                                    LogService.instance.then(
-                                      (log) => log.error(
-                                        'Chromecast cast failed',
-                                        error,
-                                        stackTrace,
-                                      ),
-                                    ),
-                                  );
-                                  if (context.mounted) {
-                                    showAppSnack(
-                                      context,
-                                      _chromecastErrorMessage(error),
-                                    );
-                                  }
-                                }
-                              },
-                            ),
-                          ),
-                        ],
-                      );
-                    },
-                  ),
-                ],
-              ),
+                                },
+                              ))
+                          .toList(),
+                    );
+                  },
+                ),
+              ],
             );
-          },
-        ),
-      );
-    },
-  );
+        },
+      ),
+    );
+  },
+);
 }
 
 Future<void> _toggleChromecast(BuildContext context) async {

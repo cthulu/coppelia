@@ -709,6 +709,18 @@ class ChromecastSession extends CastSession {
   @override
   Future<void> disconnect() async {
     CastLogger.info('Chromecast: disconnecting from ${device.name}');
+
+    // Closing the Cast transport alone leaves the Default Media Receiver
+    // playing. Stop the media session first, while the media transport is
+    // still available, then close the app and sender channels below.
+    try {
+      if (_mediaSessionId != null && _transportId != null) {
+        CastLogger.info('Chromecast: STOP before disconnect');
+        _sendMediaCommand(_mediaChannel.buildStop(_mediaSessionId!));
+      }
+    } catch (e) {
+      CastLogger.warning('Chromecast: failed to stop before disconnect: $e');
+    }
     _stopHeartbeat();
     _stopPositionPolling();
     _mediaStatusSubscription?.cancel();

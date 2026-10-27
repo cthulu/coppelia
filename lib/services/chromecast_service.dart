@@ -28,6 +28,8 @@ class ChromecastService {
   dart_cast.CastService? _desktopService;
   dart_cast.CastSession? _desktopSession;
   final Set<dart_cast.CastSession> _desktopSessions = {};
+  StreamController<List<ChromecastReceiver>>? _desktopController;
+  List<ChromecastReceiver> _lastDevices = [];
 
   Future<void> initialize() async {
     if (!isSupported || _initialized) return;
@@ -44,7 +46,7 @@ class ChromecastService {
 
   Stream<List<ChromecastReceiver>> get devicesStream {
     if (_isDesktop) {
-      return _startDesktopDiscovery();
+      return _getDesktopDevicesStream();
     }
     return GoogleCastDiscoveryManager.instance.devicesStream.map(
       (devices) => devices
@@ -105,6 +107,7 @@ class ChromecastService {
     MediaItem item, {
     String? streamUrl,
     String? localFilePath,
+    Map<String, String>? httpHeaders,
     Duration startPosition = Duration.zero,
     bool autoPlay = true,
   }) async {
@@ -120,8 +123,9 @@ class ChromecastService {
       }
       final media = localFilePath == null
           ? dart_cast.CastMedia(
-              url: streamUrl!,
+              url: streamUrl ?? (throw StateError('A stream URL is required.')),
               type: dart_cast.CastMediaType.hls,
+              httpHeaders: httpHeaders ?? const {},
               title: item.title,
               imageUrl: item.imageUrl,
               startPosition: startPosition,
@@ -176,7 +180,7 @@ class ChromecastService {
     );
     await GoogleCastRemoteMediaClient.instance.loadMedia(
       media,
-      autoPlay: true,
+      autoPlay: autoPlay,
       playPosition: startPosition,
     );
   }
@@ -206,16 +210,29 @@ class ChromecastService {
       await _closeDesktopSessions();
       return;
     }
+    // Ending a Cast session does not necessarily stop the media receiver.
+    // Stop the active media session explicitly before closing the sender
+    // connection so playback cannot continue after disconnecting.
+    try {
+      await GoogleCastRemoteMediaClient.instance.stop();
+    } catch (_) {
+      // There may be no active media session; ending the Cast session is still
+      // the correct cleanup operation.
+    }
     await GoogleCastSessionManager.instance.endSessionAndStopCasting();
   }
 
-  Stream<List<ChromecastReceiver>> _startDesktopDiscovery() {
-    late StreamController<List<ChromecastReceiver>> controller;
-    StreamSubscription<List<dart_cast.CastDevice>>? subscription;
-    controller = StreamController<List<ChromecastReceiver>>.broadcast(
+  Stream<List<ChromecastReceiver>> _getDesktopDevicesStream() {
+    _desktopController ??= StreamController<List<ChromecastReceiver>>.broadcast(
       onListen: () {
-        if (subscription != null) return;
-        _desktopService?.stopDiscovery();
+        if (_desktopService != null) {
+          // Discovery is already running. Emit the cached state so the
+          // new subscriber doesn't have to wait for the next pulse.
+          if (_lastDevices.isNotEmpty) {
+            _desktopController?.add(_lastDevices);
+          }
+          return;
+        }
         _desktopService = dart_cast.CastService(
           discoveryProviders: [
             dart_cast.ChromecastDiscoveryProvider(),
@@ -226,30 +243,29 @@ class ChromecastService {
             return session;
           },
         );
-        subscription = _desktopService!.startDiscovery().listen(
-              (devices) {
-                controller.add(
-                  devices
-                      .map(
-                        (device) => ChromecastReceiver(
-                          id: device.id,
-                          name: device.name,
-                          model: 'Chromecast',
-                          desktopDevice: device,
-                        ),
-                      )
-                      .toList(),
-                );
-              },
-              onError: controller.addError,
-              onDone: () {
-                subscription = null;
-                controller.close();
-              },
-            );
+        _desktopService!
+            .startDiscovery(
+          timeout: const Duration(hours: 24),
+        )
+            .listen(
+          (devices) {
+            _lastDevices = devices
+                .map(
+                  (device) => ChromecastReceiver(
+                    id: device.id,
+                    name: device.name,
+                    model: 'Chromecast',
+                    desktopDevice: device,
+                  ),
+                )
+                .toList();
+            _desktopController?.add(_lastDevices);
+          },
+          onError: _desktopController!.addError,
+        );
       },
     );
-    return controller.stream;
+    return _desktopController!.stream;
   }
 
   Future<void> _closeDesktopSessions() async {

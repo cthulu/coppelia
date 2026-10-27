@@ -60,11 +60,6 @@ class ChromecastDiscoveryProvider implements DeviceDiscoveryProvider {
       },
     );
 
-    // Close after timeout
-    Timer(timeout, () {
-      stopDiscovery();
-    });
-
     return _controller!.stream;
   }
 

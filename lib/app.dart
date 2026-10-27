@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:ui';
 
 import 'package:audio_service/audio_service.dart';
 import 'package:flutter/material.dart';
@@ -78,8 +79,40 @@ class CoppeliaApp extends StatelessWidget {
   }
 }
 
-class _AppShell extends StatelessWidget {
+class _AppShell extends StatefulWidget {
   const _AppShell();
+
+  @override
+  State<_AppShell> createState() => _AppShellState();
+}
+
+class _AppShellState extends State<_AppShell>
+    with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  Future<AppExitResponse> didRequestAppExit() async {
+    // Block app termination until the playback engine (mpv) is fully disposed.
+    // Without this, Flutter's Dart VM teardown races with the mpv core thread,
+    // causing EXC_BAD_ACCESS crashes when the user quits while a song plays.
+    try {
+      final appState = context.read<AppState>();
+      await appState.disposePlayback();
+    } catch (_) {
+      // If disposal fails for any reason, allow the app to exit anyway.
+    }
+    return AppExitResponse.exit;
+  }
 
   @override
   Widget build(BuildContext context) {
